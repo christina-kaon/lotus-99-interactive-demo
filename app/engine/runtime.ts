@@ -1,0 +1,451 @@
+/**
+ * 新链路运行层（与 storyforge/app/api/story/route.ts 同构）：
+ *   P4a 回合路由 → makePacket 把选中的故事包材料原样投影 → P4b 互动正文生成器。
+ * 本文件不含任何 Lotus 专名；故事从 StoryPack 读。
+ */
+import P4A_TEMPLATE from "../prompts/p4a";
+import P4B_TEMPLATE from "../prompts/p4b";
+import { turnFilmGrammar } from "../workflow-prompts";
+import { completion, jsonCandidates } from "./kaon";
+import {
+  normaliseClickedChoice,
+  normaliseNewNpc,
+  normaliseProgress,
+  type ClickedChoice,
+  type DynamicNpc,
+  type EngineState,
+  type Progress,
+} from "./state";
+import { STAGES, type PackAnchor, type PackCharacter, type StoryPack } from "./story-pack";
+
+export type HistoryItem = { role: "player" | "story"; text: string };
+export type SidecarChoice = { label: string; kind: "mainline" | "deepen" | "freeplay"; anchor_id: string | null };
+
+type StageCharacter = {
+  id?: string;
+  name: string;
+  role: string;
+  character_core: string;
+  voice_and_behavior: string;
+  current_stance: string;
+  first_visible_appearance: boolean;
+  performance_card: PackCharacter["performance_card"];
+};
+
+export type Packet = ReturnType<typeof makePacket>;
+
+export type TurnOutcome = {
+  packet: Packet;
+  prose: string;
+  handoff_snapshot: string;
+  choices: SidecarChoice[];
+  game_state_delta: Record<string, unknown> | undefined;
+  state_cards: unknown[];
+  notices: string[];
+  /** 本轮在场角色的显示名 → 角色 id（别名期显示别名，不映射到真身）。 */
+  speaker_map: Array<{ label: string; person?: string }>;
+};
+
+const styleTurn = () => ({ turn_directive: turnFilmGrammar, few_shots: [] as string[] });
+
+export function anchorById(pack: StoryPack, id: string | null | undefined) {
+  return id ? pack.anchors.find((anchor) => anchor.id === id) : undefined;
+}
+
+export function currentAnchor(pack: StoryPack, progress: Progress): PackAnchor {
+  return anchorById(pack, progress.active_anchor_id)
+    ?? pack.anchors.find((anchor) => anchor.chapter_id === progress.chapter_id)
+    ?? pack.anchors[0];
+}
+
+function chapterIndex(pack: StoryPack, chapterId: string) {
+  return pack.chapters.findIndex((chapter) => chapter.chapter_id === chapterId);
+}
+
+export function isEligibleAnchor(pack: StoryPack, anchor: PackAnchor, progress: Progress) {
+  if (progress.active_anchor_id === anchor.id) return true;
+  if (progress.resolved_anchor_ids.includes(anchor.id)) return false;
+  const current = chapterIndex(pack, progress.chapter_id);
+  const target = chapterIndex(pack, anchor.chapter_id);
+  if (current < 0 || target < current || target > current + 1) return false;
+  if (target === current) return STAGES.indexOf(anchor.stage) >= STAGES.indexOf(progress.stage);
+  // 下一章只开放“起”，且 P4a 自己的规则要求玩家明确换时间/地点才会用它。
+  return anchor.stage === "起";
+}
+
+export function candidateAnchors(pack: StoryPack, progress: Progress) {
+  return pack.anchors.filter((anchor) => isEligibleAnchor(pack, anchor, progress));
+}
+
+function applyClickedMainline(pack: StoryPack, route: Record<string, unknown>, clicked: ClickedChoice | null, previous: Progress) {
+  if (clicked?.kind !== "mainline" || !clicked.anchor_id) return route;
+  const anchor = anchorById(pack, clicked.anchor_id);
+  if (!anchor || !isEligibleAnchor(pack, anchor, previous)) return route;
+  if (previous.active_anchor_id === anchor.id) return { ...route, mode: "continue_deepen", selected_anchor_id: null };
+  return { ...route, mode: "activate_anchor", selected_anchor_id: anchor.id };
+}
+
+/** 别名期显示别名；真名从 name_public_from_index 起（或正文已揭开后）可用。 */
+export function displayName(character: PackCharacter, state: EngineState, currentIndex: number) {
+  if (state.revealed_ids.includes(character.id) || currentIndex >= character.name_public_from_index) return character.name;
+  return character.aliases[0] ?? character.name;
+}
+
+function stageCharacter(character: PackCharacter, state: EngineState, currentIndex: number, seen: Set<string>): StageCharacter {
+  const name = displayName(character, state, currentIndex);
+  const aliased = name !== character.name;
+  return {
+    id: character.id,
+    name,
+    role: aliased ? character.alias_role : character.role,
+    character_core: character.character_core,
+    voice_and_behavior: character.voice_and_behavior,
+    current_stance: character.current_stance,
+    first_visible_appearance: !seen.has(name),
+    performance_card: character.performance_card,
+  };
+}
+
+function dynamicCharacter(npc: DynamicNpc, seen: Set<string>): StageCharacter {
+  const parts = npc.profile.split(/[；;。]/).map((part) => part.trim()).filter(Boolean);
+  const [identity, visual, habit, purpose] = parts;
+  const habitText = habit || "说话会先看一眼现场的人和物，再决定是否开口。";
+  const purposeText = purpose || "处理这次突然回到你面前所带来的现实事务。";
+  return {
+    name: npc.name,
+    role: identity || `${npc.relationship} / 临时来访者`,
+    character_core: `${npc.relationship}。${npc.profile}`,
+    voice_and_behavior: habitText,
+    current_stance: purposeText,
+    first_visible_appearance: !seen.has(npc.name),
+    performance_card: {
+      visual_signature: visual || "带着与身份相符、能被一眼认出的随身物进入现场。",
+      habitual_behavior: habitText,
+      pressure_response: "被质疑时先停下手边的事，再把回答落回眼前要处理的现实问题。",
+      private_goal: purposeText,
+      relationship_tactic: "不替你下结论，先用正在发生的事确认彼此还能不能把话说下去。",
+      first_entry_cue: "带着一件必须当场处理的现实事务出现，先处理它，再与现场的人对上。",
+    },
+  };
+}
+
+function samePair(left: unknown, right: readonly string[]) {
+  return Array.isArray(left) && left.length === 2 && left.every((item) => typeof item === "string")
+    && ((left[0] === right[0] && left[1] === right[1]) || (left[0] === right[1] && left[1] === right[0]));
+}
+
+/** 当前进度下对玩家可见文本仍然禁止出现的揭示词（来自 revealGates.forbidden_reveals 原文）。 */
+export function forbiddenTerms(pack: StoryPack, currentIndex: number) {
+  return pack.reveal_rules.filter((rule) => rule.opens_at_index > currentIndex).flatMap((rule) => rule.forbidden_reveals);
+}
+
+/** 已经在玩家面前成立的事实（segment 白名单 ∩ known_by 含 player ∩ 门槛已开）。 */
+function establishedFacts(pack: StoryPack, currentIndex: number) {
+  const allowed = new Set(pack.anchors.filter((anchor) => anchor.segment_index <= currentIndex).flatMap((anchor) => anchor.allowed_fact_ids));
+  return pack.facts.filter((fact) => {
+    if (!allowed.has(fact.id) || !fact.known_by.includes("player")) return false;
+    if (!fact.reveal_gate_id) return true;
+    const rule = pack.reveal_rules.find((entry) => entry.gate_id === fact.reveal_gate_id);
+    return Boolean(rule && rule.opens_at_index < currentIndex);
+  }).map((fact) => fact.text);
+}
+
+/** 公开关系（双方真名都已可用、且未到揭示章节的关系不投影）。 */
+function publicRelationships(pack: StoryPack, state: EngineState, currentIndex: number) {
+  const chapterNo = chapterIndex(pack, state.progress.chapter_id) + 1;
+  const nameOk = (name: string) => {
+    const character = pack.cast.find((entry) => entry.name === name);
+    return !character || displayName(character, state, currentIndex) === character.name;
+  };
+  return pack.relationships.filter((relationship) =>
+    (!relationship.reveal_from_chapter || chapterNo >= relationship.reveal_from_chapter)
+    && relationship.pair.every(nameOk));
+}
+
+export function baseRelationshipMemory(pack: StoryPack, state: EngineState, currentIndex: number) {
+  return publicRelationships(pack, state, currentIndex).map((relationship) => ({
+    pair: relationship.pair,
+    facts: [relationship.relationship_context],
+    unresolved_context: [] as string[],
+  }));
+}
+
+function knowledgeBoundaries(pack: StoryPack, state: EngineState, currentIndex: number, onStage: StageCharacter[]) {
+  const boundaries: Array<{ who: string; does_not_know: string }> = [];
+  for (const character of onStage) {
+    const packChar = pack.cast.find((entry) => entry.id === character.id);
+    if (packChar?.does_not_know.length) boundaries.push({ who: character.name, does_not_know: packChar.does_not_know.join("；") });
+  }
+  const forbidden = forbiddenTerms(pack, currentIndex);
+  if (forbidden.length) boundaries.push({ who: "旁白与所有在场角色（对玩家可见的文本，当前章节禁止公开）", does_not_know: forbidden.join("；") });
+  const chapterNo = chapterIndex(pack, state.progress.chapter_id) + 1;
+  for (const relationship of pack.relationships) {
+    if (!relationship.director_note) continue;
+    if (relationship.reveal_from_chapter && chapterNo >= relationship.reveal_from_chapter) continue;
+    boundaries.push({ who: relationship.pair.filter((name) => name !== "你").join("与"), does_not_know: relationship.director_note });
+  }
+  return boundaries;
+}
+
+export function makePacket(pack: StoryPack, route: Record<string, unknown>, state: EngineState, scheduledNpc: DynamicNpc | null = null) {
+  const previous = state.progress;
+  const selected = typeof route.selected_anchor_id === "string" ? anchorById(pack, route.selected_anchor_id) : undefined;
+  const mode = route.mode === "activate_anchor" || route.mode === "open_action" ? route.mode : "continue_deepen";
+  const safeMode = mode === "activate_anchor" && !(selected && isEligibleAnchor(pack, selected, previous)) ? "continue_deepen" : mode;
+  const reservedNames = new Set(pack.cast.flatMap((character) => [character.name, ...character.aliases]));
+  const newNpc = scheduledNpc || normaliseNewNpc(route.new_npc, state.dynamic_npcs, reservedNames);
+  const next = normaliseProgress(route.progress, previous);
+  const resolvedAnchorIds = safeMode === "activate_anchor" && selected && previous.active_anchor_id && previous.active_anchor_id !== selected.id
+    ? [...new Set([...next.resolved_anchor_ids, previous.active_anchor_id])]
+    : next.resolved_anchor_ids;
+  const progress: Progress = safeMode === "activate_anchor" && selected
+    ? {
+      ...next,
+      chapter_id: selected.chapter_id,
+      stage: selected.stage,
+      active_anchor_id: selected.id,
+      resolved_anchor_ids: resolvedAnchorIds,
+      tension_summary: pack.chapters.find((chapter) => chapter.chapter_id === selected.chapter_id)?.stages.find((stage) => stage.anchor_ids.includes(selected.id))?.stage_pressure ?? selected.content,
+    }
+    : previous;
+  const anchor = currentAnchor(pack, progress);
+  const currentIndex = anchor.segment_index;
+  const chapter = pack.chapters.find((item) => item.chapter_id === progress.chapter_id) ?? pack.chapters[0];
+  const stage = chapter.stages.find((item) => item.stage === progress.stage) ?? chapter.stages[0];
+
+  const selection = route.context_selection && typeof route.context_selection === "object" ? route.context_selection as Record<string, unknown> : {};
+  const allNpcs = newNpc ? [...state.dynamic_npcs, newNpc] : state.dynamic_npcs;
+  const seen = new Set(state.seen_character_names);
+  const known = new Map<string, StageCharacter>();
+  pack.cast.forEach((character) => {
+    const staged = stageCharacter(character, state, currentIndex, seen);
+    known.set(staged.name, staged);
+  });
+  allNpcs.forEach((npc) => known.set(npc.name, dynamicCharacter(npc, seen)));
+  const requestedNames = Array.isArray(selection.character_names)
+    ? selection.character_names.filter((name): name is string => typeof name === "string" && known.has(name))
+    : [];
+  const defaultNames = anchor.present.flatMap((id) => {
+    const character = pack.cast.find((entry) => entry.id === id);
+    return character ? [displayName(character, state, currentIndex)] : [];
+  });
+  const stagedNames = [...new Set([...(newNpc ? [newNpc.name] : []), ...requestedNames])].slice(0, 3);
+  // P4a 明确输出空 character_names 表示玩家要独处；只有它什么都没给时才回落到本段 present。
+  const routerChoseNobody = Array.isArray(selection.character_names) && selection.character_names.length === 0;
+  const finalNames = stagedNames.length ? stagedNames : routerChoseNobody ? [] : defaultNames;
+  const onStage = finalNames.flatMap((name) => known.get(name) ? [known.get(name)!] : []);
+
+  const relationships = [
+    ...publicRelationships(pack, state, currentIndex).map(({ pair, relationship_context, interaction_dynamic }) => ({ pair, relationship_context, interaction_dynamic })),
+    ...allNpcs.map((npc) => ({
+      pair: ["你", npc.name] as [string, string],
+      relationship_context: npc.relationship,
+      interaction_dynamic: "这个人的到场会让旧有称谓、物件归属、站位或未说完的话重新变得具体；不要替任何人下结论。",
+    })),
+  ];
+  const requestedPairs = Array.isArray(selection.relationship_pairs) ? selection.relationship_pairs : [];
+  const relevantRelationships = relationships.filter((relationship) =>
+    requestedPairs.some((pair) => samePair(pair, relationship.pair))
+    || (relationship.pair.some((name) => finalNames.includes(name)) && relationship.pair.includes("你"))
+    || (relationship.pair.every((name) => finalNames.includes(name)) && finalNames.length > 1)).slice(0, 4);
+
+  const memoryPool = baseRelationshipMemory(pack, state, currentIndex);
+  const memoryIndexes = Array.isArray(selection.memory_indexes)
+    ? selection.memory_indexes.filter((index): index is number => typeof index === "number" && Number.isInteger(index) && index >= 0 && index < memoryPool.length)
+    : [];
+  const relationshipMemory = (memoryIndexes.length
+    ? memoryIndexes.map((index) => memoryPool[index])
+    : memoryPool.filter((memory) => memory.pair.some((name) => finalNames.includes(name)))).slice(0, 3);
+
+  const eligible = candidateAnchors(pack, progress);
+  const requestedMainline = typeof route.mainline_choice_id === "string" ? eligible.find((item) => item.id === route.mainline_choice_id) || null : null;
+  const fallbackMainline = eligible.find((item) => item.id !== progress.active_anchor_id) || null;
+  const mainline = requestedMainline && requestedMainline.id !== progress.active_anchor_id ? requestedMainline : fallbackMainline;
+  const textureIndexes = Array.isArray(selection.texture_indexes)
+    ? selection.texture_indexes.filter((index): index is number => typeof index === "number" && Number.isInteger(index) && index >= 0 && index < pack.texture_pool.length)
+    : [];
+  const ruleIndexes = Array.isArray(selection.setting_rule_indexes)
+    ? selection.setting_rule_indexes.filter((index): index is number => typeof index === "number" && Number.isInteger(index) && index >= 0 && index < pack.setting_rules.length)
+    : [];
+
+  return {
+    mode: safeMode,
+    selected_anchor_id: safeMode === "activate_anchor" && selected ? selected.id : null,
+    new_npc: newNpc,
+    progress,
+    turn_context: {
+      story_premise: pack.story_premise,
+      player_context: state.player_profile ? `${pack.player_context} 玩家自述的本次身份：${state.player_profile}` : pack.player_context,
+      relevant_setting_rules: ruleIndexes.length ? ruleIndexes.map((index) => pack.setting_rules[index]) : pack.setting_rules,
+      on_stage_characters: onStage.map(({ id: _id, ...character }) => character),
+      relevant_relationships: relevantRelationships,
+      relevant_knowledge_boundaries: knowledgeBoundaries(pack, state, currentIndex, onStage),
+      relationship_memory: relationshipMemory,
+      established_facts: establishedFacts(pack, currentIndex),
+      scene: {
+        chapter_pressure: chapter.chapter_pressure,
+        stage_pressure: stage.stage_pressure,
+        active_anchor: {
+          id: anchor.id,
+          content: anchor.content,
+          location: anchor.location,
+          beats: anchor.beats,
+          progression: anchor.progression,
+        },
+        director_notes: {
+          open_questions: anchor.open_questions,
+          forbidden_transitions: anchor.forbidden_transitions,
+        },
+        textures: textureIndexes.length ? textureIndexes.map((index) => pack.texture_pool[index]) : chapter.textures.slice(0, 3),
+      },
+      choice_guide: mainline ? { anchor_id: mainline.id, direction: mainline.content } : null,
+      handoff: state.handoff_snapshot,
+    },
+    on_stage_ids: onStage.map((character) => ({ label: character.name, person: character.id })),
+  };
+}
+
+function routerInput(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null, routerNpcs: DynamicNpc[]) {
+  const currentIndex = currentAnchor(pack, state.progress).segment_index;
+  return {
+    progress: state.progress,
+    handoff_snapshot: state.handoff_snapshot,
+    recent_scene_excerpt: recentScene,
+    player_input: input,
+    clicked_choice: clicked,
+    anchors: candidateAnchors(pack, state.progress).map(({ id, chapter_id, stage, label, content }) => ({ id, chapter_id, stage, label, content })),
+    characters: [
+      ...pack.cast.map((character) => {
+        const name = displayName(character, state, currentIndex);
+        return { name, role: name === character.name ? character.role : character.alias_role, current_stance: character.current_stance };
+      }),
+      ...routerNpcs.map((npc) => ({ name: npc.name, role: npc.profile.split(/[；;。]/)[0] || npc.relationship, current_stance: npc.profile })),
+    ],
+    relationships: [
+      ...publicRelationships(pack, state, currentIndex).map(({ pair, relationship_context }) => ({ pair, relationship_context })),
+      ...routerNpcs.map((npc) => ({ pair: ["你", npc.name], relationship_context: npc.relationship })),
+    ],
+    setting_rules: pack.setting_rules.map((content, index) => ({ index, content })),
+    textures: pack.texture_pool.map((content, index) => ({ index, content })),
+    relationship_memory: baseRelationshipMemory(pack, state, currentIndex).map((memory, index) => ({ index, ...memory })),
+    dynamic_npcs: routerNpcs,
+  };
+}
+
+function turnPrompt(packet: Packet, recentScene: string, input: string, gameState: Record<string, unknown>) {
+  return P4B_TEMPLATE
+    .replace("{{turn_packet}}", JSON.stringify(packet))
+    .replace("{{handoff_snapshot}}", packet.turn_context.handoff)
+    .replace("{{recent_scene_excerpt}}", recentScene)
+    .replace("{{player_input}}", input)
+    .replace("{{game_state}}", JSON.stringify(gameState))
+    .replace("{{style_turn}}", JSON.stringify(styleTurn()));
+}
+
+function normaliseGuard(text: string) {
+  return text.normalize("NFKC").toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+export function leakedTerm(text: string, terms: string[]) {
+  const haystack = normaliseGuard(text);
+  return terms.find((term) => {
+    const needle = normaliseGuard(term);
+    return needle.length >= 2 && haystack.includes(needle);
+  });
+}
+
+function fallbackChoices(pack: StoryPack, packet: Packet): SidecarChoice[] {
+  const guide = packet.turn_context.choice_guide;
+  const alternate: SidecarChoice = { label: "先把眼前这件事说清楚", kind: "deepen", anchor_id: null };
+  if (guide) {
+    const anchor = anchorById(pack, guide.anchor_id);
+    return [{ label: anchor ? `先把这一步走完：${anchor.label}` : "顺着眼前的安排，把这件事处理下去", kind: "mainline", anchor_id: guide.anchor_id }, alternate];
+  }
+  return [alternate, { label: "先看看现场还有什么没被注意到", kind: "freeplay", anchor_id: null }];
+}
+
+export function normaliseTurnChoices(pack: StoryPack, value: unknown, packet: Packet): SidecarChoice[] {
+  const guide = packet.turn_context.choice_guide;
+  const supplied = Array.isArray(value)
+    ? value.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as Record<string, unknown>;
+      if (typeof record.label !== "string" || !record.label.trim()) return [];
+      return [{
+        label: record.label.trim().slice(0, 42),
+        kind: record.kind === "mainline" || record.kind === "deepen" || record.kind === "freeplay" ? record.kind : undefined,
+        anchor_id: typeof record.anchor_id === "string" ? record.anchor_id : null,
+      }];
+    })
+    : [];
+  const unique = supplied.filter((choice, index, all) => all.findIndex((candidate) => candidate.label === choice.label) === index);
+  const fallback = fallbackChoices(pack, packet);
+  const mainline: SidecarChoice | null = guide
+    ? unique.find((choice) => choice.kind === "mainline")
+      ? { label: unique.find((choice) => choice.kind === "mainline")!.label, kind: "mainline", anchor_id: guide.anchor_id }
+      : fallback.find((choice) => choice.kind === "mainline")!
+    : null;
+  const secondaryRaw = unique.find((choice) => choice.kind === "deepen" || choice.kind === "freeplay")
+    ?? unique.find((choice) => choice.kind !== "mainline")
+    ?? fallback.find((choice) => choice.kind !== "mainline")!;
+  const secondary: SidecarChoice = { label: secondaryRaw.label, kind: secondaryRaw.kind === "freeplay" ? "freeplay" : "deepen", anchor_id: null };
+  const output: SidecarChoice[] = mainline ? [mainline, secondary] : [secondary];
+  if (output.length < 2) {
+    const extra = unique.find((choice) => choice.label !== output[0].label) ?? fallback.find((choice) => choice.label !== output[0].label)!;
+    output.push({ label: extra.label, kind: extra.kind === "deepen" ? "deepen" : "freeplay", anchor_id: null });
+  }
+  return output.slice(0, 2);
+}
+
+export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null): Promise<TurnOutcome> {
+  const notices: string[] = [];
+  const routerNpcs = state.dynamic_npcs;
+  let route: Record<string, unknown> = {};
+  try {
+    const routerResponse = await completion(P4A_TEMPLATE, JSON.stringify(routerInput(pack, state, recentScene, input, normaliseClickedChoice(clicked), routerNpcs)), { temperature: 0.22, maxTokens: 850, timeoutMs: 45000 });
+    route = jsonCandidates(routerResponse.raw);
+  } catch (error) {
+    // 路由失败时按 continue_deepen 继续，正文仍然生成；只是这一轮不会推进锚点。
+    notices.push(`router_fallback:${error instanceof Error ? error.message : String(error)}`);
+    route = { mode: "continue_deepen" };
+  }
+  route = applyClickedMainline(pack, route, clicked, state.progress);
+  const packet = makePacket(pack, route, state);
+  const currentIndex = currentAnchor(pack, packet.progress).segment_index;
+  const forbidden = forbiddenTerms(pack, currentIndex);
+
+  let parsed: Record<string, unknown> = {};
+  let prose = "";
+  let extraInstruction = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state), `只输出 JSON。${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
+    try {
+      parsed = jsonCandidates(response.raw);
+    } catch (error) {
+      notices.push(`writer_json_retry:${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    prose = typeof parsed.prose === "string" ? parsed.prose.trim() : "";
+    if (!prose) { notices.push("writer_empty_prose_retry"); continue; }
+    const leaked = leakedTerm([prose, typeof parsed.handoff_snapshot === "string" ? parsed.handoff_snapshot : ""].join("\n"), forbidden);
+    if (leaked && attempt < 2) {
+      notices.push(`writer_reveal_retry:${leaked}`);
+      extraInstruction = `上一稿在可见文本里出现了当前章节禁止公开的内容「${leaked}」，请保持同一场戏重写，让知情角色回避、掩饰或只说部分真话，不得让该信息出现在 prose 或 handoff_snapshot。`;
+      prose = "";
+      continue;
+    }
+    break;
+  }
+  if (!prose) throw new Error("正文没有生成");
+
+  return {
+    packet,
+    prose,
+    handoff_snapshot: typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : "场内的安排尚未收束。",
+    choices: normaliseTurnChoices(pack, parsed.choice_sidecar, packet),
+    game_state_delta: parsed.game_state && typeof parsed.game_state === "object" && !Array.isArray(parsed.game_state) ? parsed.game_state as Record<string, unknown> : undefined,
+    state_cards: Array.isArray(parsed.state_cards) ? parsed.state_cards : [],
+    notices,
+    speaker_map: packet.on_stage_ids,
+  };
+}

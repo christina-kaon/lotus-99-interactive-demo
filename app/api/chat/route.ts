@@ -1,271 +1,31 @@
-import type { Message } from "../../story-data";
-import { callStoryModel } from "../../model-client";
-import { buildRuntimePacket, currentArcPhase, runtimePolicyIssue, validateAndNormalizeTurn, visibleCharacterIds } from "../../workflow-policy";
-import { prompt3 } from "../../workflow-prompts";
-import { chapterProgressionRule, commitRuntimeWorkflow, getWorkflow } from "../../workflow-store";
-import { openWorkflowToken, sealWorkflow } from "../../workflow-token";
-import type {
-  ChapterClueReward,
-  ChapterClueRewardDefinition,
-  ChapterCompletePayload,
-  PlayerInputKind,
-  RuntimePackage,
-  RuntimeSegment,
-  StoryPackage,
-} from "../../workflow-contract";
+/**
+ * 逐轮接口（新链路）：P4a 回合路由 → packet → P4b 互动正文 → 确定性切成前端事件。
+ * 前端契约不变：{ workflowToken, events[], choices[], current, present, visibleCharacters, responseContract,
+ *                playerProfile, mediaCues, chapterComplete, transition, finaleVote }。
+ */
+import type { Message, Person } from "../../story-data";
+import { cast as uiCast } from "../../story-data";
+import {
+  chapterChangePayload,
+  finaleVotePayload,
+  proseToEvents,
+  publicCharacterIds,
+  toFrontendChoices,
+  type SpeakerLabel,
+} from "../../engine/adapter";
+import { resolveMediaCues } from "../../engine/lotus-media";
+import { currentAnchor, displayName, runTurn } from "../../engine/runtime";
+import { clickedChoiceFromId, type EngineState } from "../../engine/state";
+import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
+import { openState, sealState } from "../../engine/token";
+import { responseContract } from "./contract";
 
-const playerInputKinds = new Set<PlayerInputKind>(["action", "speech", "freeform", "identity"]);
+// 路由 + 正文（含重试）可能超过默认函数时长；Vercel Pro 上限内放宽。
+export const maxDuration = 300;
 
-const fallbackDialogue: Record<string, string> = {
-  erin: "好。先把眼前这一步做实，别替任何人抢着下结论。",
-  harold: "可以继续，但把证据和猜测分开。我们只处理已经看见的东西。",
-  miller: "行。至少这个办法比盯着坏像素祈祷靠谱。",
-  ward: "你们可以接着问。答案愿不愿意出现，是另一回事。",
-  maya: "这次先听我说完。别急着替我决定这件事意味着什么。",
-  daniel: "慢一点。这里最容易骗人的，往往是你最想相信的那部分。",
-};
+const playerInputKinds = new Set(["action", "speech", "freeform", "identity"]);
 
-/** Canon-safe fallback used only when a model reply cannot safely advance state. */
-function canonicalFallbackCandidate(runtime: RuntimePackage, segment: RuntimeSegment, inputKind: PlayerInputKind) {
-  const phase = currentArcPhase(runtime, segment);
-  const plotUnlocked = runtime.state.social_beats_in_segment >= segment.tempo_budget.min_social_beats_before_plot_advance;
-  const eligibleMaterials = plotUnlocked
-    ? segment.materials.filter((material) => segment.allowed_material_ids.includes(material.id)
-      && !runtime.state.used_material_ids.includes(material.id))
-    : [];
-  const approvedMaterial = phase === "转"
-    ? eligibleMaterials[0]
-    : phase === "合"
-      ? eligibleMaterials[eligibleMaterials.length - 1]
-      : undefined;
-  const first = segment.present[0];
-  const second = segment.present[1] ?? first;
-  const third = segment.present[2] ?? second;
-  const acknowledgement = inputKind === "identity"
-    ? "你说明了自己准备以什么身份加入。屋里的人各自看了你一眼，态度不完全一样，但没人再把你当作路过的人。"
-    : "你的选择让争论停了一拍。现场没有继续兜圈子，几个人开始把话变成下一步。";
-  const movement = approvedMaterial?.detail
-    ?? "桌上的记录被重新排开。有人核对眼前的细节，有人盯着其他人的反应，现场往前挪了一小步。";
-
-  if (approvedMaterial?.id === "m_ch02_s03_song") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "action", person: "erin", text: "螺丝被拧出半寸。隔板后先响起一声电流爆音，早已断电的壁挂旧音响随即断断续续放出一段带留声机杂音的乡村吉他旋律。艾琳的手电光猛地晃开，整个人僵在原地。" },
-        { type: "dialogue", person: "erin", text: "那是丹尼尔八岁时在吉他上创作的，除了我和他没人知道。" },
-        { type: "reaction", person: "miller", text: "米勒脸上的玩笑彻底没了。他先看向通道，再看向艾琳，没有急着否定她。" },
-      ],
-      choices: [
-        { kind: "action", text: "陪艾琳追向通道" },
-        { kind: "speech", text: "先让米勒记下声音" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch02_s03_disguise_plan") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "action", person: "erin", text: "通道尽头的人影已经消失，艾琳仍要往侧门追。米勒横过一步，硬把她拦了下来。" },
-        { type: "dialogue", person: "miller", text: "他妈是圈套！今晚到此为止，真想混进内场，我会找我傻逼二次元兄弟借一些Cosplay衣服，换了再来。" },
-        { type: "dialogue", person: "erin", text: "……你居然真有这种朋友。" },
-      ],
-      choices: [
-        { kind: "speech", text: "让米勒现在就去借" },
-        { kind: "action", text: "先把今晚的线索带走" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch05_s01_erin_song_memory") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "dialogue", person: "erin", text: "丹尼尔八岁那年，整条街停电。他抱着一把少了两根弦的旧吉他，对着电池录音机弹了一晚上。不是为了写歌。他只是觉得，屋里有声音，别人就不会那么害怕。" },
-        { type: "reaction", person: "miller", text: "米勒没有插科打诨。他低头看着那篇论文，等艾琳自己决定还要说多少。" },
-        { type: "dialogue", person: "harold", text: "这解释了他为什么会留下。但还没解释，为什么所有人都该承担他的选择。" },
-      ],
-      choices: [
-        { kind: "speech", text: "让艾琳把故事讲完" },
-        { kind: "speech", text: "问哈罗德他在怕什么" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch05_s01_erin_pattern") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "dialogue", person: "erin", text: "他后来总在码头喂那只黑猫，也总把别人扔掉的坏东西带回家修。他最受不了的，是看见一个人在难受，自己却什么都做不了。Lotus让他以为，这次他终于能把所有东西修好。" },
-        { type: "dialogue", person: "miller", text: "所以他不是不爱外面的人。他是受不了爱一个人，还救不了他。" },
-        { type: "dialogue", person: "erin", text: "对。理解他，不等于我同意他。" },
-      ],
-      choices: [
-        { kind: "speech", text: "问艾琳她想救哪一个他" },
-        { kind: "speech", text: "让哈罗德回应这段过去" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch05_s01_harold_argument") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "dialogue", person: "harold", text: "我以前拿犯罪率下降替这地方辩护。那是错的。一个需要少数人永远替全城守边界的世界，不是避难所，是一份没人签过字的合同。" },
-        { type: "dialogue", person: "miller", text: "漂亮。那你打算怎么处理合同里已经住进去的人？连人带纸一起烧了？" },
-        { type: "dialogue", person: "erin", text: "别抢着赢。哈罗德，回答他。" },
-      ],
-      choices: [
-        { kind: "speech", text: "追问摧毁会失去谁" },
-        { kind: "speech", text: "让米勒提出保留条件" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch05_s01_miller_argument") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "dialogue", person: "miller", text: "每天十一分钟。记忆完整，明确自愿，随时能走，每次开门都留记录。守门的人管不住，就换人、换规矩。别先把里面的人当垃圾清掉。" },
-        { type: "dialogue", person: "harold", text: "规矩不会自己站岗。只要门还在，就总有人觉得自己比规矩更仁慈。" },
-        { type: "dialogue", person: "erin", text: "很好。一个怕门失控，一个怕人被抹掉。现在说你们愿意为哪边负责。" },
-      ],
-      choices: [
-        { kind: "speech", text: "逼哈罗德承认摧毁也是决定" },
-        { kind: "speech", text: "问米勒谁来监督入口" },
-      ],
-    };
-  }
-
-  if (approvedMaterial?.id === "m_ch05_s01_deadlock") {
-    return {
-      events: [
-        { type: "narration", text: acknowledgement },
-        { type: "dialogue", person: "harold", text: "我的票是摧毁。不是因为现实值得原谅，是因为它必须属于所有醒着的人。" },
-        { type: "dialogue", person: "miller", text: "我投保留。把边界写死，把守门人盯死。但别替里面的人决定，他们的生活不算生活。" },
-        { type: "dialogue", person: "erin", text: "一比一。我不会拿丹尼尔替自己投票。最后一票是你的。" },
-      ],
-      choices: [
-        { kind: "speech", text: "确认两边都说完了" },
-        { kind: "action", text: "走到最后一票前" },
-      ],
-    };
-  }
-
-  return {
-    events: [
-      { type: "narration", text: acknowledgement },
-      { type: "dialogue", person: first, text: fallbackDialogue[first] ?? "先按这个方向走。眼前能确认多少，就确认多少。" },
-      { type: "action", person: second, text: movement },
-      { type: "dialogue", person: third, text: fallbackDialogue[third] ?? "我来接下一步。要是哪里对不上，我们再回来拆。" },
-    ],
-    choices: [
-      { kind: "action", text: "顺着现在线索继续查" },
-      { kind: "speech", text: "先问清谁在隐瞒什么" },
-    ],
-  };
-}
-
-function cinematicFallbackCandidate(
-  candidate: { events: Array<{ type: string; person?: string; text: string }>; choices: Array<{ kind: string; text: string }> },
-  segment: RuntimeSegment,
-  minEvents = 8,
-  maxEvents = 12,
-) {
-  const first = segment.present[0];
-  const second = segment.present[1] ?? first;
-  const third = segment.present[2] ?? second;
-  const continuation = [
-    { type: "narration", text: `没有人把现场按下暂停。${segment.scene.slice(0, 120)}` },
-    { type: "reaction", person: second, text: "他没有急着接话，先把刚才被忽略的细节重新核对了一遍。" },
-    { type: "dialogue", person: first, text: fallbackDialogue[first] ?? "先别急着收口。眼前这件事还有一层没说清。" },
-    { type: "action", person: third, text: "他顺着现场已有的东西继续往下查，把一个原本只停留在猜测里的问题摆到了众人面前。" },
-    { type: "dialogue", person: second, text: fallbackDialogue[second] ?? "这一步做完，我们至少知道下一扇门该从哪边推。" },
-    { type: "narration", text: "几个人的分歧没有消失，却第一次落到了同一个可以执行的问题上。" },
-  ];
-  const events = [...candidate.events];
-  let index = 0;
-  while (events.length < minEvents) {
-    events.push(continuation[index % continuation.length]);
-    index += 1;
-  }
-  return { ...candidate, events: events.slice(0, maxEvents) };
-}
-
-type VisibleEvent = {
-  type: "narration" | "dialogue" | "action" | "reaction";
-  person?: string;
-  text: string;
-};
-
-type VisibleChoice = { kind: "action" | "speech"; text: string };
-type VisibleTurn = { events: VisibleEvent[]; choices: VisibleChoice[] };
-
-const visibleEventTypes = new Set<VisibleEvent["type"]>(["narration", "dialogue", "action", "reaction"]);
-
-function visibleEvent(value: unknown, present: Set<string>): VisibleEvent | undefined {
-  if (!value || typeof value !== "object") return;
-  const item = value as Record<string, unknown>;
-  if (typeof item.text !== "string" || !item.text.trim()) return;
-  const requestedType = typeof item.type === "string" && visibleEventTypes.has(item.type as VisibleEvent["type"])
-    ? item.type as VisibleEvent["type"]
-    : "narration";
-  const person = typeof item.person === "string" && present.has(item.person.trim()) ? item.person.trim() : undefined;
-  const type = requestedType === "dialogue" && !person
-    ? "narration"
-    : requestedType === "narration" && person
-      ? "reaction"
-      : requestedType;
-  return { type, ...(person ? { person } : {}), text: item.text.trim().slice(0, 320) };
-}
-
-function visibleChoice(value: unknown): VisibleChoice | undefined {
-  if (!value || typeof value !== "object") return;
-  const item = value as Record<string, unknown>;
-  if (typeof item.text !== "string" || !item.text.trim()) return;
-  const kind: VisibleChoice["kind"] = item.kind === "action" ? "action" : "speech";
-  const text = item.text.trim()
-    .replace(/^(?:你说|玩家|动作)\s*[:：]\s*/u, "")
-    .replace(/^你\s*[:：]?\s*/u, "")
-    .slice(0, 24)
-    .trim();
-  return text ? { kind, text } : undefined;
-}
-
-function visibleTurnCandidate(raw: unknown, runtime: RuntimePackage, segment: RuntimeSegment, inputKind: PlayerInputKind): VisibleTurn {
-  const present = new Set(segment.present);
-  const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
-  const { min, max } = runtime.runtime.response_contract.event_count;
-  const fallback = cinematicFallbackCandidate(canonicalFallbackCandidate(runtime, segment, inputKind), segment, min, max);
-  const fallbackEvents = fallback.events.flatMap((entry) => visibleEvent(entry, present) ?? []);
-  const events = (Array.isArray(item.events) ? item.events : [])
-    .flatMap((entry) => visibleEvent(entry, present) ?? [])
-    .slice(0, max);
-  let fallbackIndex = 0;
-  while (events.length < min && fallbackEvents.length) {
-    events.push(fallbackEvents[fallbackIndex % fallbackEvents.length]);
-    fallbackIndex += 1;
-  }
-
-  const fallbackChoices = fallback.choices.flatMap((entry) => visibleChoice(entry) ?? []);
-  const choices = (Array.isArray(item.choices) ? item.choices : [])
-    .flatMap((entry) => visibleChoice(entry) ?? [])
-    .filter((entry, index, list) => list.findIndex((candidate) => candidate.text === entry.text) === index)
-    .slice(0, 2);
-  for (const entry of fallbackChoices) {
-    if (choices.length >= 2) break;
-    if (!choices.some((candidate) => candidate.text === entry.text)) choices.push(entry);
-  }
-  if (choices.length < 2 && !choices.some((entry) => entry.text === "先听听他们怎么说")) choices.push({ kind: "speech", text: "先听听他们怎么说" });
-  if (choices.length < 2) choices.push({ kind: "action", text: "先把眼前的事做完" });
-  return { events: events.slice(0, max), choices: choices.slice(0, 2) };
-}
-
-function isNetworkOrTimeoutFailure(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /abort|timed?\s*out|timeout|network|fetch failed|econn|enotfound|socket/i.test(message);
-}
-
+/** 与旧链路相同的“我是 X / 我改成 X”身份声明识别（原文照搬）。 */
 function explicitPlayerProfileUpdate(input: string) {
   const text = input.trim();
   const patterns = [
@@ -281,378 +41,130 @@ function explicitPlayerProfileUpdate(input: string) {
   return "";
 }
 
-function publicFact(runtime: RuntimePackage, factId: string) {
-  if (runtime.state.facts.includes(factId) || runtime.state.revealed_fact_ids.includes(factId)) return true;
-  const fact = runtime.facts.catalog.find((entry) => entry.id === factId);
-  return Boolean(fact && fact.kind === "locked" && fact.known_by.includes("player"));
+function unique<T>(values: T[]) {
+  return [...new Set(values)];
 }
 
-function chapterMaterial(runtime: RuntimePackage, chapterId: string, materialId: string) {
-  for (const segment of runtime.segments) {
-    if (segment.chapter_id !== chapterId || !segment.allowed_material_ids.includes(materialId)) continue;
-    const material = segment.materials.find((entry) => entry.id === materialId);
-    if (material) return material;
-  }
-  return undefined;
-}
-
-/**
- * Completion cards are authored presentation for story material that has
- * already been committed in the completed chapter. Do not downgrade that
- * authored media merely because a separate reveal ledger used a different
- * condition label; the material having actually played is the authority here.
- */
-function legalCompletionSource(runtime: RuntimePackage, chapterId: string, sourceRef: string) {
-  const separator = sourceRef.indexOf(":");
-  if (separator < 1) return false;
-  const kind = sourceRef.slice(0, separator);
-  const id = sourceRef.slice(separator + 1);
-  if (!id) return false;
-  if (kind === "fact") return publicFact(runtime, id);
-  if (kind !== "material") return false;
-
-  const material = chapterMaterial(runtime, chapterId, id);
-  if (!material) return false;
-  return runtime.state.used_material_ids.includes(id);
-}
-
-function exposedReward(definition: ChapterClueRewardDefinition): ChapterClueReward {
-  const { source_refs: sourceRefs, ...reward } = definition;
-  return { ...reward, sourceRefs } as ChapterClueReward;
-}
-
-function fallbackReward(runtime: RuntimePackage, completedSegment: RuntimeSegment): ChapterClueReward | undefined {
-  const chapterSegments = runtime.segments.filter((segment) => segment.chapter_id === completedSegment.chapter_id);
-  const materials = chapterSegments.flatMap((segment) => segment.materials).reverse();
-  const material = materials.find((entry) => legalCompletionSource(runtime, completedSegment.chapter_id, `material:${entry.id}`));
-  if (material) {
-    return {
-      id: `clue_${completedSegment.chapter_id}_${material.id}`,
-      type: "message",
-      title: "获得新线索",
-      text: material.detail,
-      sourceRefs: [`material:${material.id}`],
-    };
-  }
-
-  const allowedFactIds = [...new Set(chapterSegments.flatMap((segment) => segment.allowed_fact_ids))].reverse();
-  const fact = allowedFactIds
-    .map((id) => runtime.facts.catalog.find((entry) => entry.id === id))
-    .find((entry) => entry && publicFact(runtime, entry.id));
-  return fact ? {
-    id: `clue_${completedSegment.chapter_id}_${fact.id}`,
-    type: "message",
-    title: "获得新线索",
-    text: fact.text,
-    sourceRefs: [`fact:${fact.id}`],
-  } : undefined;
-}
-
-function chapterCompletePayload(
-  story: StoryPackage,
-  runtime: RuntimePackage,
-  completedSegment: RuntimeSegment,
-): ChapterCompletePayload | undefined {
-  const chapterIndex = story.user_view.chapter_outline.findIndex((chapter) => chapter.id === completedSegment.chapter_id);
-  const chapter = story.user_view.chapter_outline[chapterIndex];
-  if (!chapter) return undefined;
-
-  const definition = runtime.runtime.chapter_completions?.find((entry) => entry.chapter_id === completedSegment.chapter_id);
-  const configuredRewardIsLegal = Boolean(definition?.reward.source_refs.length)
-    && definition!.reward.source_refs.every((sourceRef) => legalCompletionSource(runtime, completedSegment.chapter_id, sourceRef));
-  const reward = definition && configuredRewardIsLegal
-    ? exposedReward(definition.reward)
-    : fallbackReward(runtime, completedSegment);
-  if (!reward) return undefined;
-
-  const transitionMedia = definition && configuredRewardIsLegal && definition.transition_media
-    ? {
-      kind: definition.transition_media.kind,
-      title: definition.transition_media.title,
-      status: definition.transition_media.url && definition.transition_media.status !== "pending" ? "ready" as const : "pending" as const,
-      ...(definition.transition_media.url ? { url: definition.transition_media.url } : {}),
-      ...(definition.transition_media.poster ? { poster: definition.transition_media.poster } : {}),
-      ...(definition.transition_media.caption ? { caption: definition.transition_media.caption } : {}),
+/** 最近场景摘录：前端回传的消息历史压成“人名：台词 / 旁白”文本，供 P4a/P4b 读上文。 */
+function recentSceneExcerpt(history: Message[], pack: StoryPack, state: EngineState, currentIndex: number) {
+  const lines = history.slice(-16).map((message) => {
+    const text = message.text.trim();
+    if (!text) return "";
+    if (message.kind === "player") return `你：${text}`;
+    if (message.person) {
+      const character = pack.cast.find((entry) => entry.id === message.person);
+      const label = character ? displayName(character, state, currentIndex) : message.label ?? message.person;
+      return `${label}：${text}`;
     }
-    : undefined;
+    return text;
+  }).filter(Boolean);
+  let excerpt = lines.join("\n");
+  while (excerpt.length > 2600 && lines.length > 2) {
+    lines.shift();
+    excerpt = lines.join("\n");
+  }
+  return excerpt || state.handoff_snapshot;
+}
 
-  return {
-    chapterId: chapter.id,
-    chapterNumber: chapterIndex + 1,
-    title: chapter.title,
-    reward,
-    ...(transitionMedia ? { transitionMedia } : {}),
-  };
+/** 正文里允许被识别为说话人的标签 → 前端 person id（未公开的角色只给标签，不带头像/真名）。 */
+function speakerLabels(pack: StoryPack, state: EngineState, currentIndex: number, publicIds: string[], npcNames: string[]): SpeakerLabel[] {
+  const labels: SpeakerLabel[] = [];
+  for (const character of pack.cast) {
+    const person = publicIds.includes(character.id) ? character.id : undefined;
+    labels.push({ label: displayName(character, state, currentIndex), person });
+    labels.push({ label: character.name, person });
+    for (const alias of character.aliases) labels.push({ label: alias, person });
+  }
+  for (const name of npcNames) labels.push({ label: name });
+  return labels;
 }
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json() as { sessionId?: string; workflowToken?: string; history?: Message[]; input?: string; inputKind?: string; playerProfile?: string };
-    const sessionId = body.sessionId?.trim();
-    const submittedWorkflowToken = body.workflowToken?.trim();
+    const body = await request.json() as {
+      sessionId?: string; workflowToken?: string; history?: Message[]; input?: string; inputKind?: string; playerProfile?: string; choiceId?: string;
+    };
+    const token = body.workflowToken?.trim();
     const input = body.input?.trim();
-    if ((!sessionId && !submittedWorkflowToken) || !input) return Response.json({ error: "workflow_session_or_input_missing" }, { status: 400 });
+    if (!token || !input) return Response.json({ error: token ? "workflow_session_or_input_missing" : "workflow_not_compiled" }, { status: token ? 400 : 409 });
 
-    const workflow = submittedWorkflowToken
-      ? await openWorkflowToken(submittedWorkflowToken)
-      : sessionId ? getWorkflow(sessionId) : undefined;
-    if (!workflow) return Response.json({ error: "workflow_not_compiled" }, { status: 409 });
-    const currentWorkflowToken = submittedWorkflowToken || await sealWorkflow(workflow);
-    const runtimePackage = workflow.runtimePackage;
-    const segment = runtimePackage.segments.find((entry) => entry.id === runtimePackage.state.current_segment);
-    if (!segment) return Response.json({ error: "runtime_segment_missing" }, { status: 500 });
-    const policyIssue = runtimePolicyIssue(runtimePackage, segment);
-    if (policyIssue) return Response.json({ error: `runtime_policy_invalid:${policyIssue}` }, { status: 502 });
-    const chapterRule = chapterProgressionRule(runtimePackage, segment.chapter_id);
-    const successfulTurns = runtimePackage.state.successful_turns_by_chapter?.[segment.chapter_id] ?? 0;
-    if (successfulTurns >= chapterRule.max_successful_turns) {
-      return Response.json({
-        error: "chapter_turn_limit_reached",
-        chapterId: segment.chapter_id,
-        successfulTurns,
-        maxSuccessfulTurns: chapterRule.max_successful_turns,
-      }, { status: 409 });
-    }
+    const pack = lotusStoryPack();
+    const state = await openState(token);
+    if (state.story !== pack.id) return Response.json({ error: "workflow_story_mismatch" }, { status: 409 });
+    if (state.finale_choice) return Response.json({ error: "finale_already_decided" }, { status: 409 });
 
-    const requestedInputKind = body.inputKind?.trim() as PlayerInputKind | undefined;
-    const declaredProfileUpdate = explicitPlayerProfileUpdate(input);
-    const inputKind: PlayerInputKind = declaredProfileUpdate
-      ? "identity"
-      : requestedInputKind && playerInputKinds.has(requestedInputKind)
-      ? requestedInputKind
-      : "freeform";
+    const requestedKind = body.inputKind?.trim() ?? "";
+    const declaredProfile = explicitPlayerProfileUpdate(input);
+    const inputKind = declaredProfile ? "identity" : playerInputKinds.has(requestedKind) ? requestedKind : "freeform";
     const submittedProfile = typeof body.playerProfile === "string" ? body.playerProfile.trim().slice(0, 100) : "";
-    const playerProfile = declaredProfileUpdate
-      || (inputKind === "identity" ? (submittedProfile || input.slice(0, 100)) : submittedProfile);
+    const playerProfile = declaredProfile || (inputKind === "identity" ? (submittedProfile || input.slice(0, 100)) : submittedProfile) || state.player_profile;
+    const workingState: EngineState = { ...state, player_profile: playerProfile };
+
     const history = Array.isArray(body.history)
       ? body.history.filter((message): message is Message => Boolean(message && typeof message === "object" && typeof message.text === "string")).slice(-30)
       : [];
-    const policyRuntime: RuntimePackage = runtimePackage;
-    const context = {
-      runtime: policyRuntime,
-      segment,
-      story: workflow.storyPackage,
-      history,
-      userInput: input,
-      inputKind,
+    const previousIndex = currentAnchor(pack, state.progress).segment_index;
+    const recentScene = recentSceneExcerpt(history, pack, workingState, previousIndex);
+    const clicked = clickedChoiceFromId(body.choiceId);
+
+    const outcome = await runTurn(pack, workingState, recentScene, input, clicked);
+    const { packet } = outcome;
+    const anchor = currentAnchor(pack, packet.progress);
+    const currentIndex = anchor.segment_index;
+    const previousChapterId = state.progress.chapter_id;
+    const chapterChanged = packet.progress.chapter_id !== previousChapterId;
+    const activatedAnchorId = packet.mode === "activate_anchor" ? packet.selected_anchor_id : null;
+
+    // 身份已在正文里揭开（例如零点摘面罩）的角色，从这一轮起真名可用。
+    const npcNames = [...state.dynamic_npcs, ...(packet.new_npc ? [packet.new_npc] : [])].map((npc) => npc.name);
+    const publicIds = publicCharacterIds(pack, currentIndex);
+    const events = proseToEvents(outcome.prose, speakerLabels(pack, workingState, currentIndex, publicIds, npcNames));
+    if (!events.length) throw new Error("正文没有可显示的内容");
+
+    const media = resolveMediaCues(events, packet.progress.active_anchor_id, activatedAnchorId, state.played_media_ids);
+    const revealedIds = unique([...state.revealed_ids, ...media.reveals]) as Person[];
+
+    const finaleReady = Boolean(pack.finale_vote && packet.progress.active_anchor_id === pack.finale_vote.trigger_segment_id);
+    const finaleVote = finaleReady && !state.finale_ready ? finaleVotePayload(pack) : undefined;
+    const change = chapterChanged ? chapterChangePayload(pack, previousChapterId, packet.progress.chapter_id) : { chapterComplete: undefined, transition: undefined };
+
+    const nextState: EngineState = {
+      ...workingState,
+      progress: packet.progress,
+      handoff_snapshot: outcome.handoff_snapshot,
+      seen_character_names: unique([...state.seen_character_names, ...packet.turn_context.on_stage_characters.map((character) => character.name)]),
+      dynamic_npcs: packet.new_npc ? [...state.dynamic_npcs, packet.new_npc] : state.dynamic_npcs,
+      game_state: outcome.game_state_delta ? { ...state.game_state, ...outcome.game_state_delta } : state.game_state,
+      played_media_ids: [...state.played_media_ids, ...media.cues.map((cue) => cue.id)],
+      revealed_ids: revealedIds,
+      completed_chapters: chapterChanged ? unique([...state.completed_chapters, previousChapterId]) : state.completed_chapters,
+      turns: state.turns + 1,
+      finale_ready: state.finale_ready || finaleReady,
     };
-    const packet = buildRuntimePacket(
-      policyRuntime,
-      segment,
-      workflow.storyPackage,
-      history,
-      playerProfile,
-      inputKind,
-    );
 
-    let raw: unknown;
-    let modelFallbackReason = "";
-    try {
-      raw = await callStoryModel(
-        prompt3(packet, input, inputKind),
-        "生成Prompt 3本轮输出。",
-        0.55,
-        4200,
-        {
-          stage: "prompt3",
-          requestTimeoutMs: 30000,
-        },
-      );
-    } catch (error) {
-      if (isNetworkOrTimeoutFailure(error)) throw error;
-      modelFallbackReason = error instanceof Error ? error.message : "model_output_unavailable";
-      console.warn("[prompt3-soft-policy] model output replaced with canon fallback", { reason: modelFallbackReason });
-      raw = cinematicFallbackCandidate(
-        canonicalFallbackCandidate(policyRuntime, segment, inputKind),
-        segment,
-        policyRuntime.runtime.response_contract.event_count.min,
-        policyRuntime.runtime.response_contract.event_count.max,
-      );
-    }
-
-    const modelVisibleTurn = visibleTurnCandidate(raw, policyRuntime, segment, inputKind);
-    const strictValidation = validateAndNormalizeTurn(raw, context);
-    let validation = strictValidation;
-    let visibleTurn = modelVisibleTurn;
-    let protocolNotice = modelFallbackReason;
-    if (!validation.ok) {
-      protocolNotice = validation.reason;
-      console.warn("[prompt3-soft-policy] displaying model reply and advancing with canon state", { reason: validation.reason });
-      const canonicalRaw = cinematicFallbackCandidate(
-        canonicalFallbackCandidate(policyRuntime, segment, inputKind),
-        segment,
-        policyRuntime.runtime.response_contract.event_count.min,
-        policyRuntime.runtime.response_contract.event_count.max,
-      );
-      const canonicalValidation = validateAndNormalizeTurn(canonicalRaw, context);
-      if (!canonicalValidation.ok) {
-        console.error("[prompt3-soft-policy] canon fallback could not advance state", { reason: canonicalValidation.reason });
-        return Response.json({
-          workflowToken: currentWorkflowToken,
-          events: modelVisibleTurn.events,
-          choices: modelVisibleTurn.choices,
-          current: { segmentId: segment.id, chapterId: segment.chapter_id, location: segment.location },
-          present: segment.present,
-          visibleCharacters: visibleCharacterIds(workflow.storyPackage, runtimePackage, segment),
-          responseContract: runtimePackage.runtime.response_contract,
-          playerProfile,
-          protocolNotice: canonicalValidation.reason,
-        });
-      }
-      validation = canonicalValidation;
-      // Media-critical authored beats must remain visible before their media is
-      // triggered. Other policy misses keep the model's prose on screen.
-      if (!strictValidation.ok && strictValidation.reason === "childhood_song_scene_missing") {
-        visibleTurn = visibleTurnCandidate(canonicalRaw, policyRuntime, segment, inputKind);
-      }
-    }
-
-    const previousChapter = segment.chapter_id;
-    const commit = commitRuntimeWorkflow(workflow, runtimePackage.state.version, validation.turn.state_delta);
-    if (!commit.ok) {
-      console.warn("[prompt3-soft-policy] reply shown without state commit", { reason: commit.reason });
-      return Response.json({
-        workflowToken: currentWorkflowToken,
-        events: visibleTurn.events,
-        choices: visibleTurn.choices,
-        current: { segmentId: segment.id, chapterId: segment.chapter_id, location: segment.location },
-        present: segment.present,
-        visibleCharacters: visibleCharacterIds(workflow.storyPackage, runtimePackage, segment),
-        responseContract: runtimePackage.runtime.response_contract,
-        playerProfile,
-        protocolNotice: commit.reason,
-      });
-    }
-
-    const nextSegment = commit.workflow.runtimePackage.segments.find((entry) => entry.id === commit.state.current_segment);
-    if (!nextSegment) {
-      return Response.json({
-        workflowToken: await sealWorkflow(commit.workflow),
-        events: visibleTurn.events,
-        choices: visibleTurn.choices,
-        current: { segmentId: segment.id, chapterId: segment.chapter_id, location: segment.location },
-        present: segment.present,
-        visibleCharacters: visibleCharacterIds(workflow.storyPackage, runtimePackage, segment),
-        responseContract: runtimePackage.runtime.response_contract,
-        playerProfile,
-        protocolNotice: "committed_runtime_segment_missing",
-      });
-    }
-    const chapterChanged = nextSegment.chapter_id !== previousChapter;
-    const outline = commit.workflow.storyPackage.user_view.chapter_outline.find((chapter) => chapter.id === nextSegment.chapter_id);
-    const chapterComplete = chapterChanged
-      ? chapterCompletePayload(commit.workflow.storyPackage, commit.workflow.runtimePackage, segment)
-      : undefined;
-    const chapterEntry = chapterChanged
-      ? commit.workflow.runtimePackage.runtime.chapter_entries?.find((entry) => entry.chapter_id === nextSegment.chapter_id)
-      : undefined;
-    const finaleVote = commit.workflow.runtimePackage.runtime.finale_vote?.trigger_segment_id === nextSegment.id
-      ? commit.workflow.runtimePackage.runtime.finale_vote
-      : undefined;
-    const childhoodSongMaterialUsed = validation.turn.state_delta.used_material_ids?.includes("m_ch02_s03_song") ?? false;
-    const childhoodSongEventIndex = childhoodSongMaterialUsed
-      ? visibleTurn.events.findIndex((event, index, events) => {
-        const nearby = events.slice(index, index + 3).map((entry) => entry.text).join(" ");
-        return /(旧音响|壁挂音响|扬声器|琴声|歌曲|旋律|电流爆音|合成琴)/.test(event.text)
-          && /(艾琳|她)/.test(nearby)
-          && /(听见|听到|认出|僵住|僵在|手电|弟弟)/.test(nearby);
-      })
-      : -1;
-    const usedMaterialIds = validation.turn.state_delta.used_material_ids ?? [];
-    const visualCueDefinitions = [
-      {
-        materialId: "m_ch01_s02_schedule",
-        id: "ch01-drive-to-red-hook",
-        url: "/ch01-drive-to-red-hook.png",
-        alt: "艾琳和米勒离开警局，驱车前往旧码头",
-        caption: "离开第七分局 · 前往旧码头",
-        anchor: /(离开|走出|出了|从).{0,8}(警局|第七分局).{0,10}(出发|上车|开车|前往)|(?:警局|第七分局).{0,8}(门外|台阶|停车场).{0,10}(出发|上车|开车)/,
-      },
-      {
-        materialId: "m_ch01_s04_camera_access",
-        id: "ch01-red-hook-camera-search",
-        url: "/ch02-red-hook-arrival.png",
-        alt: "众人抵达旧码头，在沿街商铺调查后巷监控",
-        caption: "旧码头 · 调查周边监控",
-        anchor: /(旧码头|Red Hook|第99号仓库|街口|商铺).{0,16}(监控|摄像头|录像)|(?:监控|摄像头|录像).{0,16}(旧码头|街口|商铺|后巷)/,
-      },
-      {
-        materialId: "m_ch01_s04_monitor",
-        id: "ch01-unknown-mechanic-monitor",
-        url: "/ch01-unknown-mechanic-monitor.png",
-        alt: "监控拍到身份不明的白发老人推着工具车穿过雨夜后巷",
-        caption: "第一章 · 后巷监控画面",
-        anchor: /(监控|录像|画面).{0,20}(白发|老人|修理工)|(?:白发|老人|修理工).{0,20}(监控|录像|画面)/,
-      },
-      {
-        materialId: "m_ch03_s02_maya",
-        id: "ch03-maya-found",
-        url: "/ch03-maya-found.png",
-        alt: "众人在 Lotus 99 找到仍然活着的玛雅",
-        caption: "Lotus 99 · 找到玛雅",
-        anchor: /(玛雅|后台|活着|本人)/,
-      },
-      {
-        materialId: "m_ch03_s03_unmask",
-        id: "ch03-zero-unmasked",
-        url: "/ch03-zero-unmasked.png",
-        alt: "零点摘下面罩，艾琳认出弟弟丹尼尔",
-        caption: "Lotus 99 · 零点摘下面罩",
-        anchor: /(零点|面罩|丹尼尔|弟弟)/,
-      },
-    ] as const;
-    const visualMediaCues = visualCueDefinitions.flatMap((definition) => {
-      if (!usedMaterialIds.includes(definition.materialId)) return [];
-      const matchedIndex = visibleTurn.events.findIndex((event) => definition.anchor.test(event.text));
-      return [{
-        id: definition.id,
-        kind: "image" as const,
-        url: definition.url,
-        alt: definition.alt,
-        caption: definition.caption,
-        eventIndex: matchedIndex >= 0 ? matchedIndex : Math.max(0, visibleTurn.events.length - 1),
-      }];
-    });
-    const travelMediaCues = segment.id === "ch01_s02" && nextSegment.id === "ch01_s03" && !visualMediaCues.some((cue) => cue.id === "ch01-drive-to-red-hook")
-      ? [{
-        id: "ch01-drive-to-red-hook",
-        kind: "image" as const,
-        url: "/ch01-drive-to-red-hook.png",
-        alt: "艾琳和米勒开车穿过雨夜，离开第七分局前往红钩第99号仓库",
-        caption: "离开第七分局 · 前往 Red Hook",
-        eventIndex: Math.max(0, visibleTurn.events.length - 1),
-      }]
-      : [];
-    const audioMediaCue = childhoodSongEventIndex >= 0 ? {
-      id: "ch02-childhood-song",
-      kind: "audio" as const,
-      url: "/childhood-country-americana-approach.mp3",
-      eventIndex: childhoodSongEventIndex,
-    } : undefined;
+    const onStageIds = outcome.speaker_map.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
+    const present = onStageIds.length ? onStageIds : anchor.present.filter((id) => publicIds.includes(id));
+    const visibleCharacters = pack.cast.map((character) => character.id).filter((id) => publicIds.includes(id) && id in uiCast);
 
     return Response.json({
-      workflowToken: await sealWorkflow(commit.workflow),
-      events: visibleTurn.events,
-      choices: visibleTurn.choices,
-      current: { segmentId: nextSegment.id, chapterId: nextSegment.chapter_id, location: nextSegment.location },
-      present: nextSegment.present,
-      visibleCharacters: visibleCharacterIds(commit.workflow.storyPackage, commit.workflow.runtimePackage, nextSegment),
-      responseContract: commit.workflow.runtimePackage.runtime.response_contract,
+      workflowToken: await sealState(nextState),
+      events,
+      choices: toFrontendChoices(outcome.choices),
+      current: { segmentId: anchor.id, chapterId: anchor.chapter_id, location: anchor.location },
+      present,
+      visibleCharacters,
+      responseContract,
       playerProfile,
-      mediaCues: [...(audioMediaCue ? [audioMediaCue] : []), ...visualMediaCues, ...travelMediaCues],
-      // Keep the original single cue during the client migration.
-      mediaCue: audioMediaCue,
-      chapterComplete,
+      mediaCues: media.cues,
+      chapterComplete: change.chapterComplete,
       finaleVote,
-      ...(protocolNotice ? { protocolNotice } : {}),
-      transition: chapterChanged ? {
-        chapterId: nextSegment.chapter_id,
-        title: outline?.title,
-        goal: outline?.synopsis,
-        ...(chapterEntry ? { entryPrompt: chapterEntry } : {}),
-      } : undefined,
+      transition: change.transition,
+      ...(outcome.notices.length ? { protocolNotice: outcome.notices.join("; ") } : {}),
+      engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: anchor.id, stage: packet.progress.stage, stateCards: outcome.state_cards },
     });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "turn_failed" }, { status: 502 });
+    const message = error instanceof Error ? error.message : "turn_failed";
+    const status = message === "workflow_token_invalid" ? 409 : 502;
+    return Response.json({ error: message }, { status });
   }
 }
