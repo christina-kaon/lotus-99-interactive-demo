@@ -92,6 +92,8 @@ export async function POST(request: Request) {
     const state = await openState(token);
     if (state.story !== pack.id) return Response.json({ error: "workflow_story_mismatch" }, { status: 409 });
     if (state.finale_choice) return Response.json({ error: "finale_already_decided" }, { status: 409 });
+    // 终局投票已经摆出来但还没投：不再往前生成，防止重放请求把剧情推过投票段。
+    if (state.finale_ready) return Response.json({ error: "finale_pending" }, { status: 409 });
 
     const requestedKind = body.inputKind?.trim() ?? "";
     const declaredProfile = explicitPlayerProfileUpdate(input);
