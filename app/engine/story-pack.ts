@@ -77,6 +77,8 @@ export type PackChapter = {
   emotional_question: string;
   stages: Array<{ stage: Stage; stage_pressure: string; anchor_ids: string[] }>;
   textures: string[];
+  /** 本章可被自然结算的条件（wiki P2「章节结算编译规则」）：沿用 chapter_arcs 里「合」拍的 dramatic_function 原文。 */
+  settlement_condition: string;
 };
 
 export type PackRelationship = {
@@ -256,6 +258,7 @@ function buildPack(): StoryPack {
       emotional_question: arc.emotional_question,
       stages,
       textures: [...new Set([ui?.scene, ...chapterSegments.map((segment) => segment.location)].filter((item): item is string => Boolean(item)))],
+      settlement_condition: arc.beats["合"].dramatic_function,
     };
   });
 

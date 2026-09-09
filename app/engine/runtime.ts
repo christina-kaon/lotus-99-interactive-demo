@@ -85,10 +85,13 @@ function applyClickedMainline(pack: StoryPack, route: Record<string, unknown>, c
   return { ...route, mode: "activate_anchor", selected_anchor_id: anchor.id };
 }
 
-/** 别名期显示别名；真名从 name_public_from_index 起（或正文已揭开后）可用。 */
-export function displayName(character: PackCharacter, state: EngineState, currentIndex: number) {
-  if (state.revealed_ids.includes(character.id) || currentIndex >= character.name_public_from_index) return character.name;
-  return character.aliases[0] ?? character.name;
+/**
+ * 角色一律按人物简介的真名/身份出现（赵艺琛 2026-09-09：「按人物简介来 不要关掉」）。
+ * 揭示前的别名机制不再作用于显示名；别名只保留为写手偶发使用时的说话人识别标签（见 chat route）。
+ * 事实层的揭示门槛（forbidden_reveals / known_by）不受影响，秘密仍按门槛控制。
+ */
+export function displayName(character: PackCharacter, _state: EngineState, _currentIndex: number) {
+  return character.name;
 }
 
 function stageCharacter(character: PackCharacter, state: EngineState, currentIndex: number, seen: Set<string>): StageCharacter {
@@ -276,6 +279,7 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
     turn_context: {
       story_premise: pack.story_premise,
       player_context: state.player_profile ? `${pack.player_context} 玩家自述的本次身份：${state.player_profile}` : pack.player_context,
+      chapter_settlement_condition: chapter.settlement_condition,
       relevant_setting_rules: ruleIndexes.length ? ruleIndexes.map((index) => pack.setting_rules[index]) : pack.setting_rules,
       on_stage_characters: onStage.map(({ id: _id, ...character }) => character),
       relevant_relationships: relevantRelationships,
@@ -397,6 +401,21 @@ export function normaliseTurnChoices(pack: StoryPack, value: unknown, packet: Pa
   return output.slice(0, 2);
 }
 
+/** P4b 输出 chapter_settled=true 时进入下一章首段的「起」；最后一章不再推进。章末结算卡由 route 按 chapter_id 变化触发。 */
+function settleChapter(pack: StoryPack, progress: Progress): Progress {
+  const next = pack.chapters[chapterIndex(pack, progress.chapter_id) + 1];
+  if (!next) return progress;
+  const firstAnchorId = next.stages.find((stage) => stage.anchor_ids.length)?.anchor_ids[0] ?? null;
+  return {
+    ...progress,
+    chapter_id: next.chapter_id,
+    stage: "起",
+    active_anchor_id: firstAnchorId,
+    resolved_anchor_ids: [...new Set([...progress.resolved_anchor_ids, ...(progress.active_anchor_id ? [progress.active_anchor_id] : [])])],
+    tension_summary: next.stages[0]?.stage_pressure ?? next.chapter_pressure,
+  };
+}
+
 export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null): Promise<TurnOutcome> {
   const notices: string[] = [];
   const routerNpcs = state.dynamic_npcs;
@@ -437,9 +456,10 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
     break;
   }
   if (!prose) throw new Error("正文没有生成");
+  if (parsed.chapter_settled === true) notices.push("chapter_settled");
 
   return {
-    packet,
+    packet: parsed.chapter_settled === true ? { ...packet, progress: settleChapter(pack, packet.progress) } : packet,
     prose,
     handoff_snapshot: typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : "场内的安排尚未收束。",
     choices: normaliseTurnChoices(pack, parsed.choice_sidecar, packet),
