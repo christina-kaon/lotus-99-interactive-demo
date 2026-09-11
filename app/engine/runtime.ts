@@ -695,7 +695,9 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
     const abort = new AbortController();
     let leaked: string | undefined;
     let streamedProse = "";
-    const result = await completionStream(system, user, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000, signal: abort.signal }, (raw) => {
+    // reasoning_effort=low：Gemini 3.7 flash 默认会先烧 ~1.5k 隐藏推理 token（09-11 实测三跑：默认档首 token 13.8s / 19.8s、
+    // 一跑把 2400 预算吃到正文截断只剩 609 字；low 档三跑首 token 1.5–1.8s、正文完整）。与开场 / 账本抽取同一处方。
+    const result = await completionStream(system, user, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000, reasoningEffort: "low", signal: abort.signal }, (raw) => {
       if (leaked) return;
       const prose = scanProse(raw);
       if (prose.length <= streamedProse.length && !proseClosed(raw)) return;
