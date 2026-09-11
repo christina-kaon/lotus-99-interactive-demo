@@ -198,3 +198,17 @@
 .opening-vlog-entry button b{display:grid;width:28px;height:28px;place-items:center;border:1px solid rgba(215,181,111,.62);border-radius:50%;font-size:8px}
 .opening-vlog-entry button:hover b{background:rgba(215,181,111,.14)}
 @media(max-width:390px){.opening-archive-wrap{margin-right:12px;margin-left:12px}.archive-masthead{padding-right:22px;padding-left:22px}.archive-body{min-height:452px;padding-right:22px;padding-left:22px}.archive-row p{font-size:12.5px}.opening-vlog-entry strong{max-width:190px}}
+
+/* Top bar: restart pill (left) + style picker pill (right) on one row, chapter title centred beneath. Both pills share the same outline; the picker's native select is stripped so it reads as one pill and never wraps inside the 430px shell (赵艺琛 09-11: lotus 加上文风下拉). */
+.topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px 8px;padding:16px 14px 12px}
+.topbar .restart{position:static;order:1;flex:0 0 auto;white-space:nowrap}
+.topbar .style-picker{position:relative;order:2;display:inline-flex;flex:0 1 auto;align-items:center;gap:6px;min-width:0;max-width:calc(100% - 118px);padding:4px 24px 4px 10px;border:1px solid rgba(215,181,111,.32);border-radius:999px;color:#bfa476;font-size:11px;letter-spacing:.04em;line-height:1.3;cursor:pointer}
+.topbar .style-picker span{display:inline;flex:0 0 auto}
+.topbar .style-picker select{min-width:0;max-width:100%;padding:0;border:0;outline:0;background:transparent;color:#d4b87e;font-family:inherit;font-size:11px;letter-spacing:.04em;line-height:1.3;appearance:none;-webkit-appearance:none;text-overflow:ellipsis;cursor:pointer}
+.topbar .style-picker select option{background:#0d0e13;color:#e6d5b5}
+.topbar .style-picker::after{content:"";position:absolute;right:10px;top:50%;width:5px;height:5px;border-right:1px solid #bfa476;border-bottom:1px solid #bfa476;transform:translateY(-70%) rotate(45deg);pointer-events:none}
+.topbar .style-picker:hover,.topbar .style-picker:focus-within{color:#d4b87e;border-color:#d4b87e;background:rgba(215,181,111,.1)}
+.topbar .style-picker:has(select:disabled){opacity:.4;cursor:wait}
+.topbar .style-picker select:disabled{cursor:wait;color:#d4b87e}
+.topbar>div{order:3;flex:1 0 100%;text-align:center}
+.topbar h1{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

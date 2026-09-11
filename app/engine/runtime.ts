@@ -5,8 +5,8 @@
  */
 import P4A_TEMPLATE from "../prompts/p4a";
 import P4B_TEMPLATE from "../prompts/p4b";
-import { turnFilmGrammar, turnFilmGrammarEn } from "../workflow-prompts";
 import { IS_EN } from "../locale";
+import { styleProfile } from "./styles";
 import { engineText, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
 import { completion, jsonCandidates } from "./kaon";
 import {
@@ -48,7 +48,11 @@ export type TurnOutcome = {
   speaker_map: Array<{ label: string; person?: string }>;
 };
 
-const styleTurn = () => ({ turn_directive: IS_EN ? turnFilmGrammarEn : turnFilmGrammar, few_shots: [] as string[] });
+/** 逐轮文风：按请求体 style_id 取档；缺省走默认档（原 turnFilmGrammar / turnFilmGrammarEn）。 */
+const styleTurn = (styleId?: string) => {
+  const style = styleProfile(styleId);
+  return { turn_directive: style.directive, few_shots: style.few_shots };
+};
 
 /** P4a / P4b 提示词本体不翻译；英文版只在末尾追加输出语言指令（中文版追加空串，逐字不变）。 */
 const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}`;
@@ -342,14 +346,14 @@ function routerInput(pack: StoryPack, state: EngineState, recentScene: string, i
   };
 }
 
-function turnPrompt(packet: Packet, recentScene: string, input: string, gameState: Record<string, unknown>) {
+function turnPrompt(packet: Packet, recentScene: string, input: string, gameState: Record<string, unknown>, styleId?: string) {
   return WRITER_TEMPLATE
     .replace("{{turn_packet}}", JSON.stringify(packet))
     .replace("{{handoff_snapshot}}", packet.turn_context.handoff)
     .replace("{{recent_scene_excerpt}}", recentScene)
     .replace("{{player_input}}", input)
     .replace("{{game_state}}", JSON.stringify(gameState))
-    .replace("{{style_turn}}", JSON.stringify(styleTurn()));
+    .replace("{{style_turn}}", JSON.stringify(styleTurn(styleId)));
 }
 
 function normaliseGuard(text: string) {
@@ -434,7 +438,7 @@ function settleChapter(pack: StoryPack, progress: Progress): Progress {
   };
 }
 
-export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null): Promise<TurnOutcome> {
+export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null, styleId?: string): Promise<TurnOutcome> {
   const notices: string[] = [];
   const routerNpcs = state.dynamic_npcs;
   let route: Record<string, unknown> = {};
@@ -455,7 +459,7 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
   let prose = "";
   let extraInstruction = "";
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state), `${engineText.jsonOnly}${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
+    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state, styleId), `${engineText.jsonOnly}${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
     try {
       parsed = jsonCandidates(response.raw);
     } catch (error) {

@@ -15,6 +15,7 @@ import {
 } from "../../engine/adapter";
 import { resolveMediaCues } from "../../engine/lotus-media";
 import { currentAnchor, displayName, runTurn } from "../../engine/runtime";
+import { styleProfile } from "../../engine/styles";
 import { clickedChoiceFromId, type EngineState } from "../../engine/state";
 import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
 import { openState, sealState } from "../../engine/token";
@@ -97,7 +98,10 @@ export async function POST(request: Request) {
   try {
     const body = await request.json() as {
       sessionId?: string; workflowToken?: string; history?: Message[]; input?: string; inputKind?: string; playerProfile?: string; choiceId?: string;
+      /** 逐轮文风 id（app/style-options.ts）；缺省 / 未知走默认档。只影响本轮及之后，不改会话状态。 */
+      style_id?: string;
     };
+    const style = styleProfile(body.style_id);
     const token = body.workflowToken?.trim();
     const input = body.input?.trim();
     if (!token || !input) return Response.json({ error: token ? "workflow_session_or_input_missing" : "workflow_not_compiled" }, { status: token ? 400 : 409 });
@@ -123,7 +127,7 @@ export async function POST(request: Request) {
     const recentScene = recentSceneExcerpt(history, pack, workingState, previousIndex);
     const clicked = clickedChoiceFromId(body.choiceId);
 
-    const outcome = await runTurn(pack, workingState, recentScene, input, clicked);
+    const outcome = await runTurn(pack, workingState, recentScene, input, clicked, style.id);
     const { packet } = outcome;
     const anchor = currentAnchor(pack, packet.progress);
     const currentIndex = anchor.segment_index;
@@ -176,7 +180,7 @@ export async function POST(request: Request) {
       finaleVote,
       transition: change.transition,
       ...(outcome.notices.length ? { protocolNotice: outcome.notices.join("; ") } : {}),
-      engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: anchor.id, stage: packet.progress.stage, stateCards: outcome.state_cards },
+      engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: anchor.id, stage: packet.progress.stage, style: style.id, stateCards: outcome.state_cards },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "turn_failed";

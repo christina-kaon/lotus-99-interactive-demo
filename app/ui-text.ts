@@ -98,6 +98,8 @@ const en: Record<string, string> = {
   "结局影像": "Ending footage",
   "结局视频待添加": "Ending video pending",
   "从头开始": "Start over",
+  "文风": "Style",
+  "选择文风，只影响之后的轮次": "Choose a writing style; it only affects the turns after this one",
 };
 
 /** 中文原文 → 当前语言。中文版恒等；英文版查表（漏译时回落到中文，构建脚本会检查漏译）。 */

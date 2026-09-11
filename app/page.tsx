@@ -3,6 +3,7 @@
 import { FormEvent, PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from "react";
 import { cast, chapters, chapterMessages, chapterArrivalChoices, costumeEntryMessages, openingArchivePages } from "./story-data";
 import { t, ui } from "./ui-text";
+import { DEFAULT_STYLE_ID, STYLE_OPTIONS, isStyleId } from "./style-options";
 import "./profile-crop.css";
 
 type EventType = "narration" | "action" | "dialogue" | "reaction";
@@ -386,6 +387,8 @@ export default function Home() {
   const [pending, setPending] = useState(false);
   const [streamingId, setStreamingId] = useState<string | number | null>(null);
   const [restartNote, setRestartNote] = useState("");
+  // 逐轮文风：只随每次 /api/chat 请求发送，切换只影响之后的轮次，不重开会话（重开要重过 Vlog 闸门）。
+  const [styleId, setStyleId] = useState(DEFAULT_STYLE_ID);
   const [watchedVlog, setWatchedVlog] = useState(false);
   const [openingApplied, setOpeningApplied] = useState(false);
   const [compiledOpening, setCompiledOpening] = useState<LockedOpening | null>(null);
@@ -550,7 +553,7 @@ export default function Home() {
     try {
       const response = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, history: historySnapshot, input: trimmed, inputKind: choice.kind, ...(playerProfile ? { playerProfile } : {}), ...("id" in choice && choice.id ? { choiceId: choice.id } : {}) }),
+        body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, history: historySnapshot, input: trimmed, inputKind: choice.kind, style_id: styleId, ...(playerProfile ? { playerProfile } : {}), ...("id" in choice && choice.id ? { choiceId: choice.id } : {}) }),
       });
       const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
       if (!response.ok) throw new Error(firstString(payload.error) ?? ui.turnFailedHttp(response.status));
@@ -820,7 +823,7 @@ export default function Home() {
   return <main className={`app-shell ${active.bg}`}>
     <aside className="sidebar"><button type="button" className="brand brand-reset" onClick={startOver} disabled={pending || workflowStatus === "compiling"} aria-label={t("从头开始")}><span className="brand-dot" />{t("↺ 从头开始")}</button><div className="case-label">{t("案件档案 / 03:00")}</div><nav className="chapter-list" aria-label={t("章节")}>{chapters.map((item, index) => <button key={item.title} disabled={index !== chapter} className={index === chapter ? "chapter active" : "chapter locked"}><span>0{index + 1}</span><strong>{item.title}</strong><small>{index === chapter ? item.sub : t("由故事状态解锁")}</small></button>)}</nav></aside>
     <section className="experience">
-      <header className="topbar"><button className="restart" type="button" onClick={startOver} disabled={pending || workflowStatus === "compiling"}>{t("↺ 从头开始")}</button><div><span>{t("静默纽约")}</span><h1>{ui.chapterHeading(chapter + 1, active.title)}</h1></div></header>
+      <header className="topbar"><button className="restart" type="button" onClick={startOver} disabled={pending || workflowStatus === "compiling"}>{t("↺ 从头开始")}</button><label className="style-picker"><span>{t("文风")}</span><select value={styleId} onChange={(event) => { if (isStyleId(event.target.value)) setStyleId(event.target.value); }} disabled={pending || workflowStatus === "compiling"} aria-label={t("选择文风，只影响之后的轮次")} title={t("选择文风，只影响之后的轮次")}>{STYLE_OPTIONS.map((option) => <option key={option.id} value={option.id} title={option.note}>{option.label}</option>)}</select></label><div><span>{t("静默纽约")}</span><h1>{ui.chapterHeading(chapter + 1, active.title)}</h1></div></header>
       <div className="cast-strip" aria-label={t("故事角色")}>{visibleActors.map((actor) => { const entry = characters[actor] ?? { id: actor, name: actor, role: t("故事角色"), bio: t("角色资料尚未公开。") }; return <div className="cast-chip" key={actor}><Avatar actor={actor} characters={characters} onOpen={setSelectedPerson} /><span>{entry.name}</span></div>; })}{!visibleActors.length && <span className="cast-empty">{t("角色正在载入…")}</span>}</div>
       <section className="cinema" aria-label={t("章节影像")}><div className="cinema-noise" /><div className="cinema-copy"><p>CHAPTER {String(chapter + 1).padStart(2, "0")}</p><h2>{active.title}</h2><span>{active.sub}</span></div>{chapter === 0 && <OpeningArchive page={openingArchivePage} onPageChange={setOpeningArchivePage} onPlay={playIntro} />}<div className="video-badge">{videoState === "cached" ? t("视频待缓存") : videoState === "playing" ? t("正在播放") : t("最后一帧已锁定为背景")}</div></section>
       {videoState !== "cached" && <section className="vlog-panel" aria-label={t("玛雅的 Vlog")}><video ref={vlogVideoRef} src="/maya-opening-vlog.mp4" poster="/chapters-maya-vlog.png" playsInline controls autoPlay={videoState === "playing"} onEnded={finishVlog} />{videoState === "frame" && <button className="close-vlog" type="button" aria-label={t("关闭 Vlog")} onClick={() => setVideoState("cached")}>×</button>}</section>}
