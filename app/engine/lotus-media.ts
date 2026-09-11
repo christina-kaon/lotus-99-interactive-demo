@@ -3,6 +3,7 @@
  * 旧链路按“material 是否已使用”门控，新链路没有 material 账本，改为按“锚点（segment）是否激活/正在进行”门控，
  * 每次游玩只触发一次（played_media_ids 记在 token 里）。
  */
+import { IS_EN } from "../locale";
 import type { Person } from "../story-data";
 import type { FrontendEvent } from "./adapter";
 
@@ -28,7 +29,7 @@ const childhoodSong = (events: FrontendEvent[]) => events.findIndex((event, inde
     && /(听见|听到|认出|僵住|僵在|手电|弟弟)/.test(nearby);
 });
 
-export const lotusMediaCues: CueDefinition[] = [
+const lotusMediaCuesZh: CueDefinition[] = [
   {
     id: "ch01-drive-to-red-hook",
     kind: "image",
@@ -86,6 +87,77 @@ export const lotusMediaCues: CueDefinition[] = [
     reveals: "daniel",
   },
 ];
+
+/**
+ * 英文版的匹配规则：与中文版逐条同源（同 id / url / 门控段），正则改成英文等价词表——
+ * 否则英文正文永远匹配不上中文正则，场景图与童年歌曲会静默不触发。alt / caption 也给英文。
+ */
+const childhoodSongEn = (events: FrontendEvent[]) => events.findIndex((event, index, all) => {
+  const nearby = all.slice(index, index + 3).map((entry) => entry.text).join(" ");
+  return /(old speaker|wall[- ]mounted speaker|speaker|loudspeaker|guitar|song|melody|tune|static|crackle|hiss of static|pop of static|synth)/i.test(event.text)
+    && /\b(Erin|she|her)\b/i.test(nearby)
+    && /(hear|heard|hears|listen|recogni[sz]e|froze|frozen|stiffen|went still|flashlight|torch|brother)/i.test(nearby);
+});
+
+const lotusMediaCuesEn: CueDefinition[] = [
+  {
+    id: "ch01-drive-to-red-hook",
+    kind: "image",
+    url: "/ch01-drive-to-red-hook.png",
+    alt: "Erin and Miller leave the precinct and drive to the old docks",
+    caption: "Leaving the Seventh Precinct · Heading for the old docks",
+    on_activate: "ch01_s03",
+    anchor: /(leave|leaving|left|out of|away from|from)[^.]{0,30}(precinct|station house|station)[^.]{0,40}(car|cruiser|drive|drove|driving|head|heading|set out|pull out)|(?:precinct|station)[^.]{0,30}(steps|door|parking lot|lot|curb)[^.]{0,40}(car|cruiser|drive|drove|driving|pull out)|(Red Hook|old docks?|old pier|old wharf|Warehouse 99|warehouse 99)/i,
+  },
+  {
+    id: "ch01-red-hook-camera-search",
+    kind: "image",
+    url: "/ch02-red-hook-arrival.png",
+    alt: "The team reaches the old docks and asks a street-front shop for its back-alley camera footage",
+    caption: "The old docks · Checking the cameras nearby",
+    on_activate: "ch01_s04",
+    while_active: "ch01_s04",
+    anchor: /(Red Hook|Warehouse 99|old docks?|street corner|corner|storefront|shop|store|bodega|deli|hardware|laundromat|clerk|cashier|owner)[^.]{0,80}(camera|footage|surveillance|CCTV|recording|feed|tape)|(?:camera|footage|surveillance|CCTV|recording|feed|tape)[^.]{0,80}(Red Hook|corner|storefront|shop|store|alley|back alley|bodega|deli)/i,
+  },
+  {
+    id: "ch01-unknown-mechanic-monitor",
+    kind: "image",
+    url: "/ch01-unknown-mechanic-monitor.png",
+    alt: "Camera footage shows an unidentified white-haired old man pushing a tool cart through the rain-soaked back alley",
+    caption: "Chapter 1 · Back-alley camera footage",
+    while_active: "ch01_s04",
+    anchor: /(camera|footage|surveillance|CCTV|recording|feed|tape|monitor|screen|playback|archive|frame)[^.]{0,100}(white[- ]haired|white hair|old man|older man|mechanic|repairman)|(?:white[- ]haired|white hair|old man|older man|mechanic|repairman)[^.]{0,100}(camera|footage|surveillance|CCTV|recording|feed|tape|monitor|screen|playback|frame)/i,
+  },
+  {
+    id: "ch02-childhood-song",
+    kind: "audio",
+    url: "/childhood-country-americana-approach.mp3",
+    while_active: "ch02_s03",
+    anchor: childhoodSongEn,
+  },
+  {
+    id: "ch03-maya-found",
+    kind: "image",
+    url: "/ch03-maya-found.png",
+    alt: "The team finds Maya, alive, inside Lotus 99",
+    caption: "Lotus 99 · Maya found",
+    while_active: "ch03_s02",
+    anchor: /\b(Maya|backstage|alive|in person|herself)\b/i,
+  },
+  {
+    id: "ch03-zero-unmasked",
+    kind: "image",
+    url: "/ch03-zero-unmasked.png",
+    alt: "Zero takes off the mask; Erin recognizes her brother Daniel",
+    caption: "Lotus 99 · Zero unmasked",
+    while_active: "ch03_s03",
+    // 摘面罩是 ch03_s03 的核心节拍；除动作句外，也认“看清/认出……脸/弟弟/Daniel”这类写法。
+    anchor: /(pull|pulls|pulled|take|takes|took|tear|tears|tore|lift|lifts|lifted|remove|removes|removed|slide|slides|slid|slip|slips|slipped|peel|peels|peeled|push|pushes|pushed|drag|drags|dragged)[^.]{0,24}\b(mask|visor|helmet)\b|\b(mask|visor|helmet)\b[^.]{0,30}\b(off|down|away|comes off|came off|falls|fell|drops|dropped)\b|(reveal|reveals|revealed|unmask|unmasks|unmasked|bare|bares|bared|see|sees|saw|look at|looks at|looked at|stare at|stares at|stared at|recogni[sz]e|recogni[sz]es|recogni[sz]ed)[^.]{0,30}\b(face|brother|Daniel)\b/i,
+    reveals: "daniel",
+  },
+];
+
+export const lotusMediaCues: CueDefinition[] = IS_EN ? lotusMediaCuesEn : lotusMediaCuesZh;
 
 export type MediaCue = { id: string; kind: "image" | "audio"; url: string; alt?: string; caption?: string; eventIndex: number };
 
