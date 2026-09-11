@@ -11,6 +11,7 @@
 import { cast as uiCast, chapters as uiChapters, storyInteraction, type Person } from "../story-data";
 import { createPrecompiledWorkflow } from "../workflow-precompiled";
 import { workflowSource } from "../workflow-source";
+import { engineText } from "./i18n";
 import type {
   ChapterCompletionDefinition,
   ChapterEntryPromptDefinition,
@@ -196,7 +197,7 @@ function buildPack(): StoryPack {
       },
       aliases: [...(aliasMap.get(id) ?? [])].sort((left, right) => left.length - right.length),
       // 丹尼尔的 Persona 原文是“艾琳的弟弟与匿名DJ”，别名期只留“匿名DJ”这半句；沃德别名期就用别名本身。
-      alias_role: id === "daniel" ? "匿名DJ" : id === "ward" ? "白发修理工" : ui.role,
+      alias_role: id === "daniel" ? engineText.aliasRoleDaniel : id === "ward" ? engineText.aliasRoleWard : ui.role,
       name_public_from_index: namePublicFrom(id),
       does_not_know: (card?.knowledge?.does_not_know ?? []).flatMap((factId) => {
         const fact = factById.get(factId);
@@ -208,7 +209,7 @@ function buildPack(): StoryPack {
   // 关系：story-data 的公开关系 + 预编译 relationshipRules 的 canonical 作为互动方式。
   const relationships: PackRelationship[] = storyInteraction.relationships.map((relationship) => {
     const ids = relationship.characters;
-    const pair: [string, string] = ids.length === 2 ? [nameOf(ids[0]), nameOf(ids[1])] : ["你", nameOf(ids[0])];
+    const pair: [string, string] = ids.length === 2 ? [nameOf(ids[0]), nameOf(ids[1])] : [engineText.playerLabel, nameOf(ids[0])];
     const rule = director.relationship_rules.find((entry) => samePeople(entry.participants, ids));
     return {
       pair,
@@ -219,7 +220,7 @@ function buildPack(): StoryPack {
     };
   });
   relationships.unshift({
-    pair: ["你", nameOf("erin")],
+    pair: [engineText.playerLabel, nameOf("erin")],
     relationship_context: source.playerContract.default_presence,
     interaction_dynamic: storyInteraction.player.defaultPresence,
   });
@@ -253,7 +254,7 @@ function buildPack(): StoryPack {
     const ui = uiChapters[chapterNumber];
     return {
       chapter_id: chapter.id,
-      act: `第${["一", "二", "三", "四", "五"][chapterNumber] ?? chapterNumber + 1}章 · ${chapter.title}`,
+      act: engineText.chapterAct(chapterNumber, chapter.title),
       chapter_pressure: ui?.goal ?? chapter.synopsis,
       emotional_question: arc.emotional_question,
       stages,
@@ -263,7 +264,7 @@ function buildPack(): StoryPack {
   });
 
   // 旧运行协议里描述“回合形状”的两条不带入（新链路按 P4b 的正文长度写，不按事件条数）。
-  const settingRules = director.constraints.filter((rule) => !/社交节拍|8至12条事件/.test(rule));
+  const settingRules = director.constraints.filter((rule) => !engineText.droppedConstraint.test(rule));
 
   return {
     id: "lotus99",

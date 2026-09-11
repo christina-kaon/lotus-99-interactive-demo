@@ -1,6 +1,7 @@
 /** 跨轮状态（封进 workflowToken 里随每轮往返）与它的规范化。 */
 import type { Person } from "../story-data";
 import type { Stage, StoryPack } from "./story-pack";
+import { engineText } from "./i18n";
 
 export type Progress = {
   chapter_id: string;
@@ -89,7 +90,7 @@ export function normaliseDynamicNpcs(value: unknown): DynamicNpc[] {
     const profile = typeof record.profile === "string" ? record.profile.trim().slice(0, 240) : "";
     if (!name || !profile || names.has(name)) return [];
     names.add(name);
-    return [{ name, relationship: relationship || "与你有一段已知关系的来访者", profile }];
+    return [{ name, relationship: relationship || engineText.npcDefaultRelationship, profile }];
   }).slice(-4);
 }
 

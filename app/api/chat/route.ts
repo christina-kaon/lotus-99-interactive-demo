@@ -19,23 +19,37 @@ import { clickedChoiceFromId, type EngineState } from "../../engine/state";
 import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
 import { openState, sealState } from "../../engine/token";
 import { responseContract } from "./contract";
+import { IS_EN, SPEAKER_SEPARATOR } from "../../locale";
+import { engineText } from "../../engine/i18n";
 
 // 路由 + 正文（含重试）可能超过默认函数时长；Vercel Pro 上限内放宽。
 export const maxDuration = 300;
 
 const playerInputKinds = new Set(["action", "speech", "freeform", "identity"]);
 
-/** 与旧链路相同的“我是 X / 我改成 X”身份声明识别（原文照搬）。 */
-function explicitPlayerProfileUpdate(input: string) {
-  const text = input.trim();
-  const patterns = [
+/** 与旧链路相同的“我是 X / 我改成 X”身份声明识别（中文原文照搬；英文版换成 "I am X / I'll play X / call me X"）。 */
+const identityPatterns = IS_EN
+  ? [
+    // 英文里 "I am X" 是日常句式（I am worried…），不当身份声明；只认带明确扮演/改名意图的句式。
+    /^(?:i(?:'ll| will) )?(?:now )?play(?: as)? (.{1,40}?)(?: now)?[.!]?$/iu,
+    /^i(?:'ll| will) (?:now )?(?:be playing|switch to|become) (.{1,40}?)(?: now)?[.!]?$/iu,
+    /^from now on,? (?:i am|i'm|i(?:'ll| will) be|call me|treat me as|consider me) (.{1,40}?)[.!]?$/iu,
+    /^(?:call me|treat me as|consider me|my (?:name|role|character) is) (.{1,40}?)[.!]?$/iu,
+  ]
+  : [
     /^我是(.{1,30}?)(?:了)?[。.!！]?$/u,
     /^我(?:现在)?(?:改成|改为|要当|要扮演|扮演)(.{1,30}?)(?:了)?[。.!！]?$/u,
     /^从现在起(?:我是|我就是|把我当成)(.{1,30}?)[。.!！]?$/u,
   ];
-  for (const pattern of patterns) {
+const identityStopWords = IS_EN
+  ? /^(?:not|so|just|going|sure|here|glad|sorry|afraid|fine|ok|okay|done|listening|asking|saying|thinking|curious|serious|kidding|tired|ready|in|out|with|all|only|still|already|about|at|on|the one|no|yes)\b/iu
+  : /^(?:说|觉得|认为|想说)/u;
+
+function explicitPlayerProfileUpdate(input: string) {
+  const text = input.trim();
+  for (const pattern of identityPatterns) {
     const candidate = text.match(pattern)?.[1]?.trim();
-    if (!candidate || /[，,；;：:\n]/u.test(candidate) || /^(?:说|觉得|认为|想说)/u.test(candidate)) continue;
+    if (!candidate || /[，,；;：:\n]/u.test(candidate) || identityStopWords.test(candidate)) continue;
     return candidate.slice(0, 100);
   }
   return "";
@@ -50,11 +64,11 @@ function recentSceneExcerpt(history: Message[], pack: StoryPack, state: EngineSt
   const lines = history.slice(-16).map((message) => {
     const text = message.text.trim();
     if (!text) return "";
-    if (message.kind === "player") return `你：${text}`;
+    if (message.kind === "player") return `${engineText.playerLabel}${SPEAKER_SEPARATOR}${text}`;
     if (message.person) {
       const character = pack.cast.find((entry) => entry.id === message.person);
       const label = character ? displayName(character, state, currentIndex) : message.label ?? message.person;
-      return `${label}：${text}`;
+      return `${label}${SPEAKER_SEPARATOR}${text}`;
     }
     return text;
   }).filter(Boolean);
@@ -121,7 +135,7 @@ export async function POST(request: Request) {
     const npcNames = [...state.dynamic_npcs, ...(packet.new_npc ? [packet.new_npc] : [])].map((npc) => npc.name);
     const publicIds = publicCharacterIds(pack, currentIndex);
     const events = proseToEvents(outcome.prose, speakerLabels(pack, workingState, currentIndex, publicIds, npcNames));
-    if (!events.length) throw new Error("正文没有可显示的内容");
+    if (!events.length) throw new Error(engineText.noVisibleEvents);
 
     const media = resolveMediaCues(events, packet.progress.active_anchor_id, activatedAnchorId, state.played_media_ids);
     const revealedIds = unique([...state.revealed_ids, ...media.reveals]) as Person[];

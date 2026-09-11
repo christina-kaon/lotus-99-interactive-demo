@@ -4,6 +4,7 @@
 import { lotusStoryPack } from "../../engine/story-pack";
 import { openState, sealState } from "../../engine/token";
 import type { EngineState } from "../../engine/state";
+import { engineText } from "../../engine/i18n";
 
 export async function POST(request: Request) {
   try {
@@ -24,7 +25,7 @@ export async function POST(request: Request) {
       ...state,
       finale_ready: true,
       finale_choice: choice,
-      handoff_snapshot: `${state.handoff_snapshot}\n你投出最后一票：${option.label}。${option.summary}`,
+      handoff_snapshot: `${state.handoff_snapshot}\n${engineText.finaleHandoff(option.label, option.summary)}`,
     };
 
     return Response.json({

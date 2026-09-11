@@ -5,7 +5,9 @@
  */
 import P4A_TEMPLATE from "../prompts/p4a";
 import P4B_TEMPLATE from "../prompts/p4b";
-import { turnFilmGrammar } from "../workflow-prompts";
+import { turnFilmGrammar, turnFilmGrammarEn } from "../workflow-prompts";
+import { IS_EN } from "../locale";
+import { engineText, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
 import { completion, jsonCandidates } from "./kaon";
 import {
   normaliseClickedChoice,
@@ -46,7 +48,11 @@ export type TurnOutcome = {
   speaker_map: Array<{ label: string; person?: string }>;
 };
 
-const styleTurn = () => ({ turn_directive: turnFilmGrammar, few_shots: [] as string[] });
+const styleTurn = () => ({ turn_directive: IS_EN ? turnFilmGrammarEn : turnFilmGrammar, few_shots: [] as string[] });
+
+/** P4a / P4b 提示词本体不翻译；英文版只在末尾追加输出语言指令（中文版追加空串，逐字不变）。 */
+const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}`;
+const WRITER_TEMPLATE = `${P4B_TEMPLATE}${writerLanguageAddendum}`;
 
 export function anchorById(pack: StoryPack, id: string | null | undefined) {
   return id ? pack.anchors.find((anchor) => anchor.id === id) : undefined;
@@ -110,24 +116,24 @@ function stageCharacter(character: PackCharacter, state: EngineState, currentInd
 }
 
 function dynamicCharacter(npc: DynamicNpc, seen: Set<string>): StageCharacter {
-  const parts = npc.profile.split(/[；;。]/).map((part) => part.trim()).filter(Boolean);
+  const parts = npc.profile.split(engineText.profileSplitter).map((part) => part.trim()).filter(Boolean);
   const [identity, visual, habit, purpose] = parts;
-  const habitText = habit || "说话会先看一眼现场的人和物，再决定是否开口。";
-  const purposeText = purpose || "处理这次突然回到你面前所带来的现实事务。";
+  const habitText = habit || engineText.npcHabit;
+  const purposeText = purpose || engineText.npcPurpose;
   return {
     name: npc.name,
-    role: identity || `${npc.relationship} / 临时来访者`,
-    character_core: `${npc.relationship}。${npc.profile}`,
+    role: identity || `${npc.relationship}${engineText.npcRoleSuffix}`,
+    character_core: `${npc.relationship}${engineText.npcCoreJoin}${npc.profile}`,
     voice_and_behavior: habitText,
     current_stance: purposeText,
     first_visible_appearance: !seen.has(npc.name),
     performance_card: {
-      visual_signature: visual || "带着与身份相符、能被一眼认出的随身物进入现场。",
+      visual_signature: visual || engineText.npcVisual,
       habitual_behavior: habitText,
-      pressure_response: "被质疑时先停下手边的事，再把回答落回眼前要处理的现实问题。",
+      pressure_response: engineText.npcPressure,
       private_goal: purposeText,
-      relationship_tactic: "不替你下结论，先用正在发生的事确认彼此还能不能把话说下去。",
-      first_entry_cue: "带着一件必须当场处理的现实事务出现，先处理它，再与现场的人对上。",
+      relationship_tactic: engineText.npcTactic,
+      first_entry_cue: engineText.npcEntry,
     },
   };
 }
@@ -177,15 +183,15 @@ function knowledgeBoundaries(pack: StoryPack, state: EngineState, currentIndex: 
   const boundaries: Array<{ who: string; does_not_know: string }> = [];
   for (const character of onStage) {
     const packChar = pack.cast.find((entry) => entry.id === character.id);
-    if (packChar?.does_not_know.length) boundaries.push({ who: character.name, does_not_know: packChar.does_not_know.join("；") });
+    if (packChar?.does_not_know.length) boundaries.push({ who: character.name, does_not_know: packChar.does_not_know.join(engineText.listJoin) });
   }
   const forbidden = forbiddenTerms(pack, currentIndex);
-  if (forbidden.length) boundaries.push({ who: "旁白与所有在场角色（对玩家可见的文本，当前章节禁止公开）", does_not_know: forbidden.join("；") });
+  if (forbidden.length) boundaries.push({ who: engineText.forbiddenWho, does_not_know: forbidden.join(engineText.listJoin) });
   const chapterNo = chapterIndex(pack, state.progress.chapter_id) + 1;
   for (const relationship of pack.relationships) {
     if (!relationship.director_note) continue;
     if (relationship.reveal_from_chapter && chapterNo >= relationship.reveal_from_chapter) continue;
-    boundaries.push({ who: relationship.pair.filter((name) => name !== "你").join("与"), does_not_know: relationship.director_note });
+    boundaries.push({ who: relationship.pair.filter((name) => name !== engineText.playerLabel).join(engineText.pairJoin), does_not_know: relationship.director_note });
   }
   return boundaries;
 }
@@ -241,15 +247,15 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
   const relationships = [
     ...publicRelationships(pack, state, currentIndex).map(({ pair, relationship_context, interaction_dynamic }) => ({ pair, relationship_context, interaction_dynamic })),
     ...allNpcs.map((npc) => ({
-      pair: ["你", npc.name] as [string, string],
+      pair: [engineText.playerLabel, npc.name] as [string, string],
       relationship_context: npc.relationship,
-      interaction_dynamic: "这个人的到场会让旧有称谓、物件归属、站位或未说完的话重新变得具体；不要替任何人下结论。",
+      interaction_dynamic: engineText.npcInteraction,
     })),
   ];
   const requestedPairs = Array.isArray(selection.relationship_pairs) ? selection.relationship_pairs : [];
   const relevantRelationships = relationships.filter((relationship) =>
     requestedPairs.some((pair) => samePair(pair, relationship.pair))
-    || (relationship.pair.some((name) => finalNames.includes(name)) && relationship.pair.includes("你"))
+    || (relationship.pair.some((name) => finalNames.includes(name)) && relationship.pair.includes(engineText.playerLabel))
     || (relationship.pair.every((name) => finalNames.includes(name)) && finalNames.length > 1)).slice(0, 4);
 
   const memoryPool = baseRelationshipMemory(pack, state, currentIndex);
@@ -278,7 +284,7 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
     progress,
     turn_context: {
       story_premise: pack.story_premise,
-      player_context: state.player_profile ? `${pack.player_context} 玩家自述的本次身份：${state.player_profile}` : pack.player_context,
+      player_context: state.player_profile ? `${pack.player_context}${engineText.playerProfilePrefix}${state.player_profile}` : pack.player_context,
       chapter_settlement_condition: chapter.settlement_condition,
       relevant_setting_rules: ruleIndexes.length ? ruleIndexes.map((index) => pack.setting_rules[index]) : pack.setting_rules,
       on_stage_characters: onStage.map(({ id: _id, ...character }) => character),
@@ -323,11 +329,11 @@ function routerInput(pack: StoryPack, state: EngineState, recentScene: string, i
         const name = displayName(character, state, currentIndex);
         return { name, role: name === character.name ? character.role : character.alias_role, current_stance: character.current_stance };
       }),
-      ...routerNpcs.map((npc) => ({ name: npc.name, role: npc.profile.split(/[；;。]/)[0] || npc.relationship, current_stance: npc.profile })),
+      ...routerNpcs.map((npc) => ({ name: npc.name, role: npc.profile.split(engineText.profileSplitter)[0] || npc.relationship, current_stance: npc.profile })),
     ],
     relationships: [
       ...publicRelationships(pack, state, currentIndex).map(({ pair, relationship_context }) => ({ pair, relationship_context })),
-      ...routerNpcs.map((npc) => ({ pair: ["你", npc.name], relationship_context: npc.relationship })),
+      ...routerNpcs.map((npc) => ({ pair: [engineText.playerLabel, npc.name], relationship_context: npc.relationship })),
     ],
     setting_rules: pack.setting_rules.map((content, index) => ({ index, content })),
     textures: pack.texture_pool.map((content, index) => ({ index, content })),
@@ -337,7 +343,7 @@ function routerInput(pack: StoryPack, state: EngineState, recentScene: string, i
 }
 
 function turnPrompt(packet: Packet, recentScene: string, input: string, gameState: Record<string, unknown>) {
-  return P4B_TEMPLATE
+  return WRITER_TEMPLATE
     .replace("{{turn_packet}}", JSON.stringify(packet))
     .replace("{{handoff_snapshot}}", packet.turn_context.handoff)
     .replace("{{recent_scene_excerpt}}", recentScene)
@@ -350,7 +356,19 @@ function normaliseGuard(text: string) {
   return text.normalize("NFKC").toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
+/** 英文按词边界匹配（否则 "Ward" 会命中 toward / forward / reward）；中文沿用去标点后的子串匹配。 */
+function normaliseWords(text: string) {
+  return text.normalize("NFKC").toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 export function leakedTerm(text: string, terms: string[]) {
+  if (IS_EN) {
+    const haystack = ` ${normaliseWords(text)} `;
+    return terms.find((term) => {
+      const needle = normaliseWords(term);
+      return needle.length >= 2 && haystack.includes(` ${needle} `);
+    });
+  }
   const haystack = normaliseGuard(text);
   return terms.find((term) => {
     const needle = normaliseGuard(term);
@@ -360,12 +378,12 @@ export function leakedTerm(text: string, terms: string[]) {
 
 function fallbackChoices(pack: StoryPack, packet: Packet): SidecarChoice[] {
   const guide = packet.turn_context.choice_guide;
-  const alternate: SidecarChoice = { label: "先把眼前这件事说清楚", kind: "deepen", anchor_id: null };
+  const alternate: SidecarChoice = { label: engineText.fallbackDeepen, kind: "deepen", anchor_id: null };
   if (guide) {
     const anchor = anchorById(pack, guide.anchor_id);
-    return [{ label: anchor ? `先把这一步走完：${anchor.label}` : "顺着眼前的安排，把这件事处理下去", kind: "mainline", anchor_id: guide.anchor_id }, alternate];
+    return [{ label: anchor ? engineText.fallbackMainline(anchor.label) : engineText.fallbackMainlineGeneric, kind: "mainline", anchor_id: guide.anchor_id }, alternate];
   }
-  return [alternate, { label: "先看看现场还有什么没被注意到", kind: "freeplay", anchor_id: null }];
+  return [alternate, { label: engineText.fallbackFreeplay, kind: "freeplay", anchor_id: null }];
 }
 
 export function normaliseTurnChoices(pack: StoryPack, value: unknown, packet: Packet): SidecarChoice[] {
@@ -376,7 +394,7 @@ export function normaliseTurnChoices(pack: StoryPack, value: unknown, packet: Pa
       const record = item as Record<string, unknown>;
       if (typeof record.label !== "string" || !record.label.trim()) return [];
       return [{
-        label: record.label.trim().slice(0, 42),
+        label: record.label.trim().slice(0, engineText.choiceLabelMax),
         kind: record.kind === "mainline" || record.kind === "deepen" || record.kind === "freeplay" ? record.kind : undefined,
         anchor_id: typeof record.anchor_id === "string" ? record.anchor_id : null,
       }];
@@ -421,7 +439,7 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
   const routerNpcs = state.dynamic_npcs;
   let route: Record<string, unknown> = {};
   try {
-    const routerResponse = await completion(P4A_TEMPLATE, JSON.stringify(routerInput(pack, state, recentScene, input, normaliseClickedChoice(clicked), routerNpcs)), { temperature: 0.22, maxTokens: 850, timeoutMs: 45000 });
+    const routerResponse = await completion(ROUTER_PROMPT, JSON.stringify(routerInput(pack, state, recentScene, input, normaliseClickedChoice(clicked), routerNpcs)), { temperature: 0.22, maxTokens: 850, timeoutMs: 45000 });
     route = jsonCandidates(routerResponse.raw);
   } catch (error) {
     // 路由失败时按 continue_deepen 继续，正文仍然生成；只是这一轮不会推进锚点。
@@ -437,7 +455,7 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
   let prose = "";
   let extraInstruction = "";
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state), `只输出 JSON。${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
+    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state), `${engineText.jsonOnly}${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
     try {
       parsed = jsonCandidates(response.raw);
     } catch (error) {
@@ -449,19 +467,19 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
     const leaked = leakedTerm([prose, typeof parsed.handoff_snapshot === "string" ? parsed.handoff_snapshot : ""].join("\n"), forbidden);
     if (leaked && attempt < 2) {
       notices.push(`writer_reveal_retry:${leaked}`);
-      extraInstruction = `上一稿在可见文本里出现了当前章节禁止公开的内容「${leaked}」，请保持同一场戏重写，让知情角色回避、掩饰或只说部分真话，不得让该信息出现在 prose 或 handoff_snapshot。`;
+      extraInstruction = engineText.leakRetry(leaked);
       prose = "";
       continue;
     }
     break;
   }
-  if (!prose) throw new Error("正文没有生成");
+  if (!prose) throw new Error(engineText.emptyProse);
   if (parsed.chapter_settled === true) notices.push("chapter_settled");
 
   return {
     packet: parsed.chapter_settled === true ? { ...packet, progress: settleChapter(pack, packet.progress) } : packet,
     prose,
-    handoff_snapshot: typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : "场内的安排尚未收束。",
+    handoff_snapshot: typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : engineText.defaultHandoff,
     choices: normaliseTurnChoices(pack, parsed.choice_sidecar, packet),
     game_state_delta: parsed.game_state && typeof parsed.game_state === "object" && !Array.isArray(parsed.game_state) ? parsed.game_state as Record<string, unknown> : undefined,
     state_cards: Array.isArray(parsed.state_cards) ? parsed.state_cards : [],
