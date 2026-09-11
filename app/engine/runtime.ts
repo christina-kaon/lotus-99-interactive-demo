@@ -382,7 +382,9 @@ export async function extractLedger(pack: StoryPack, prose: string, previous: Sc
       return character?.name;
     };
     const castNames = (input: unknown) => [...new Set(strings(input).flatMap((raw) => { const name = realName(raw); return name ? [name] : []; }))];
-    const events = strings(parsed.events_happened).map((event) => event.slice(0, 80)).slice(0, 4);
+    // 单条上限：中文 30 字以内够用 80；英文 15 词常到 90–110 字符，80 会截成半句（09-11 本地验收实测），放到 140。
+    const eventMax = IS_EN ? 140 : 80;
+    const events = strings(parsed.events_happened).map((event) => event.slice(0, eventMax)).slice(0, 4);
     const exitedNow = castNames(parsed.exited_characters);
     const enteredNow = castNames(parsed.entered_characters);
     // 本轮被路由排上场、或正文里明确入场的人视为回到现场；本轮明确离场的人加入 exited。
