@@ -57,7 +57,7 @@ const styleTurn = (styleId?: string) => {
 };
 
 /**
- * P4a / P4b 提示词本体不翻译；英文版只在末尾追加输出语言指令（中文版追加空串，逐字不变）。
+ * P4a / P4b 提示词本体为英文（2026-09-11 起与英文站同一套）；zh / en 各在末尾追加一段输出语言指令。
  * P4b 之后再追加运行层自己的事件账本指令（zh/en 各一段，不动 wiki 正文）。
  */
 const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}`;

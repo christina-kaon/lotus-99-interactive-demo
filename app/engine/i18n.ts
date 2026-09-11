@@ -86,23 +86,30 @@ const en: typeof zh = {
 export const engineText = IS_EN ? en : zh;
 
 /**
- * 英文版追加在 P4a / P4b 末尾的输出语言指令（口径对齐 storyforge-chain-demo 的 route.ts）。
- * 中文版为空字符串——提示词与原来逐字相同。
+ * 追加在 P4a / P4b 末尾的输出语言指令（口径对齐 storyforge-chain-demo 的 route.ts）。
+ * 2026-09-11 起 P4a / P4b 模板本体为英文（与英文站同一套 prompt），两个语言分支各追加一段：
+ *   en —— English-only；zh —— 简体中文输出（与 en 段对称反写），保证中文站玩家可见文本仍为中文。
  */
 export const routerLanguageAddendum = IS_EN
   ? `
 
 [LANGUAGE REQUIREMENT]
 Return every player-facing free-text field in idiomatic English only. Do not output Chinese or mixed-language labels.`
-  : "";
+  : `
+
+【语言要求】
+所有玩家可见的自由文本字段一律用地道的简体中文输出，不得输出英文或中英混杂的标签。JSON 字段名与枚举值保持原样，不翻译。`;
 
 export const writerLanguageAddendum = IS_EN
   ? `
 
 【English-only output】
 All player-facing generated fields—prose, handoff_snapshot, choice labels, state card label/title/summary/entries, game-state strings, character names, and narration—must be idiomatic English only. Do not output Chinese or mixed-language text, even if input history contains Chinese.
-The prose length rule "650–800 Chinese characters" maps to 450–600 English words for this story. Keep the screenplay layout for dialogue: "Name: line", using the English character names exactly as given in on_stage_characters. Address the player as "you".`
-  : "";
+The prose length rule "450–600 words" is already in English units for this story. Keep the screenplay layout for dialogue: "Name: line", using the English character names exactly as given in on_stage_characters. Address the player as "you".`
+  : `
+
+【中文输出】
+所有玩家可见的生成字段——prose、handoff_snapshot、选项文字、状态卡的 label/title/summary/entries、game_state 里的字符串、人物称呼与叙述——一律用地道的简体中文，不得输出英文或中英混杂的文字，即使提示词或输入里出现英文。JSON 字段名与枚举值（如 mode、kind、position、起/承/转/合）保持原样，不翻译。正文长度规则“450–600 words”在本故事对应 650–800 个汉字，其余以词数写的长度限制按同一比例理解为汉字数（anchor_text 为 8–20 字）。对白保留剧本式排版“人名：台词”，人名严格使用 on_stage_characters 给出的中文名；以“你”称呼玩家。`;
 
 /**
  * 事件账本（赵艺琛 09-11）。运行层自己的两段文本，不改 wiki 里的 P4b 正文：
