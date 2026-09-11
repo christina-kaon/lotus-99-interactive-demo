@@ -37,6 +37,12 @@ export async function completion(system: string, user: string, options: { temper
   };
   let response = await request(options.jsonMode !== false);
   if (response.status === 400 || response.status === 422) response = await request(false);
+  // Transient upstream answers (403 bursts from the router, 429, 5xx) get up to two more tries with a short backoff.
+  for (let attempt = 1; attempt <= 2 && !response.ok && (response.status === 403 || response.status === 408 || response.status === 429 || response.status >= 500); attempt++) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 5) * 1000 : 800 * attempt + Math.floor(Math.random() * 300)));
+    response = await request(options.jsonMode !== false);
+  }
   if (!response.ok) throw new Error(`model_upstream_${response.status}`);
   const data = await response.json() as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> };
   return { raw: data.choices?.[0]?.message?.content ?? "", finishReason: data.choices?.[0]?.finish_reason };
