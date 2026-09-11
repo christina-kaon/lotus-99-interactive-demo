@@ -8,7 +8,8 @@ import P4B_TEMPLATE from "../prompts/p4b";
 import { IS_EN } from "../locale";
 import { styleProfile } from "./styles";
 import { engineText, ledgerDirective, ledgerExtractionPrompt, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
-import { completion, jsonCandidates } from "./kaon";
+import { completion, completionStream, jsonCandidates, proseClosed, scanProse } from "./kaon";
+import { proseToEvents, type FrontendEvent, type SpeakerLabel } from "./adapter";
 import {
   normaliseClickedChoice,
   normaliseLedger,
@@ -48,6 +49,36 @@ export type TurnOutcome = {
   notices: string[];
   /** 本轮在场角色的显示名 → 角色 id（别名期显示别名，不映射到真身）。 */
   speaker_map: Array<{ label: string; person?: string }>;
+  /** 流式期间已经逐行发出的事件（与 prose 逐行对应；route 用它做 final 对齐）。 */
+  events: FrontendEvent[];
+  /** 揭示门槛的增量校验统计（排查用，进 final.engine）。 */
+  reveal: RevealStats;
+};
+
+export type RevealStats = {
+  /** 命中禁词后带前缀续写的次数（最多 2）。 */
+  retries: number;
+  /** 命中的禁词（按发生顺序）。 */
+  leaked: string[];
+  /** 最后一次尝试仍命中、被整行丢弃 / 截断的行数。 */
+  dropped: number;
+  /** handoff_snapshot 命中禁词被替换为缺省值。 */
+  handoff_dropped?: string;
+};
+
+/**
+ * 流式钩子：route 层用它把 P4a 结果、逐行增量、逐行收口即时推给前端。
+ * 全部可选；不传时 runTurn 行为与整包返回一致（只是内部仍按行流式校验）。
+ */
+export type TurnHooks = {
+  /** P4a 完成、packet 组好（写手还没开始）。 */
+  onRoute?: (packet: Packet) => void;
+  /** 当前进度下正文里允许识别为说话人的标签 → person（决定一行是对白还是旁白）。不传则全部按旁白。 */
+  speakers?: (packet: Packet) => SpeakerLabel[];
+  /** 第 index 条事件的**增量**文本（已经过禁词校验、确定不会被撤回的部分）。 */
+  onEventDelta?: (index: number, kind: FrontendEvent["type"], person: string | undefined, text: string) => void;
+  /** 第 index 条事件收口（最终 person / text）。 */
+  onEvent?: (index: number, event: FrontendEvent) => void;
 };
 
 /** 逐轮文风：按请求体 style_id 取档；缺省走默认档（原 turnFilmGrammar / turnFilmGrammarEn）。 */
@@ -490,7 +521,150 @@ function settleChapter(pack: StoryPack, progress: Progress): Progress {
   };
 }
 
-export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null, styleId?: string): Promise<TurnOutcome> {
+/**
+ * 逐行流式切分器：把写手流里不断增长的 prose 按行边界切成事件，边切边查禁词。
+ *
+ *  - 已完成的行：整行过 leakedTerm；干净 → 生成事件（proseToEvents 单行口径）并 onEvent 收口，记入 committed；
+ *    命中 → 返回命中词，调用方中止模型流、以 committed 为前缀续写。
+ *  - 未完成的行：先判定它是对白（开头命中说话人标签 + 冒号）还是旁白（已出现冒号但不是标签 / 长度已超过任何标签
+ *    可能的前缀），判定前不发；判定后只发「已确定」的部分——扣掉尾部 holdback（≥ 最长禁词的字符长度，英文再退到
+ *    词边界），保证任何还没写完的禁词不可能有一部分已经发出去。每次增量都对可校验部分再查一遍。
+ *  - 已发出的文字不撤回（08-27 规矩）：所以最后一次尝试（不能再重试）里仍命中的行只能整行丢弃；若该行已经发出过
+ *    安全前缀，则以已发出的文字收口（截断），不让禁词出现。
+ *  - 续写尝试开始时开启去重：模型若把前缀末尾几行重抄一遍，等值行跳过，直到出现第一行新内容。
+ */
+class LineStreamer {
+  readonly committed: string[] = [];
+  readonly events: FrontendEvent[] = [];
+  dropped = 0;
+  private readonly speakerPattern: RegExp | null;
+  private readonly maxLabelLength: number;
+  private readonly holdback: number;
+  private linesDone = 0;
+  private current: { emitted: number; kind?: FrontendEvent["type"]; person?: string; poisoned: boolean } = { emitted: 0, poisoned: false };
+  private dedupe = false;
+  private dropOnLeak = false;
+
+  constructor(private readonly speakers: SpeakerLabel[], private readonly forbidden: string[], private readonly hooks: TurnHooks) {
+    const labels = [...new Set(speakers.map((speaker) => speaker.label.trim()).filter(Boolean))].sort((left, right) => right.length - left.length);
+    this.speakerPattern = labels.length
+      ? new RegExp(`^\\**(${labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\**(?:[（(][^）)]{0,16}[）)])?\\s*[：:]\\s*(.+)$`)
+      : null;
+    this.maxLabelLength = labels.reduce((max, label) => Math.max(max, label.length), 0);
+    const longestTerm = forbidden.reduce((max, term) => Math.max(max, term.length), 0);
+    this.holdback = Math.ceil(longestTerm * 1.5) + 8;
+  }
+
+  /** 新一次写手调用开始：清掉未完成行；续写时打开去重、最后一次尝试时切到丢弃模式。 */
+  beginAttempt(options: { continuation: boolean; lastAttempt: boolean }) {
+    this.linesDone = 0;
+    this.current = { emitted: 0, poisoned: false };
+    this.dedupe = options.continuation && this.committed.length > 0;
+    this.dropOnLeak = options.lastAttempt;
+  }
+
+  /** 喂入本次尝试到目前为止的完整 prose；closed=true 表示 prose 字段已闭合。返回命中的禁词（需要中止时）。 */
+  feed(prose: string, closed: boolean): string | undefined {
+    const lines = prose.split(/\r?\n/);
+    const completeCount = closed ? lines.length : lines.length - 1;
+    for (; this.linesDone < completeCount; this.linesDone += 1) {
+      const leaked = this.completeLine(lines[this.linesDone]);
+      if (leaked) return leaked;
+      this.current = { emitted: 0, poisoned: false };
+    }
+    if (!closed && lines.length) return this.partialLine(lines[lines.length - 1]);
+    return undefined;
+  }
+
+  private isDuplicate(line: string) {
+    const needle = normaliseGuard(line);
+    return needle.length > 0 && this.committed.slice(-4).some((done) => normaliseGuard(done) === needle);
+  }
+
+  private couldBeDuplicatePrefix(partial: string) {
+    const needle = normaliseGuard(partial);
+    return needle.length === 0 || this.committed.slice(-4).some((done) => normaliseGuard(done).startsWith(needle));
+  }
+
+  private completeLine(rawLine: string): string | undefined {
+    const line = rawLine.trim();
+    if (!line) return undefined;
+    if (this.dedupe) {
+      if (this.isDuplicate(line)) return undefined;
+      this.dedupe = false;
+    }
+    const leaked = leakedTerm(line, this.forbidden);
+    if (leaked) {
+      if (!this.dropOnLeak) return leaked;
+      // 不能再重试：这一行不能露出去。已发出过安全前缀就用它收口，否则整行丢掉。
+      this.dropped += 1;
+      if (this.current.emitted > 0 && this.current.kind) {
+        const shown = this.emittedText;
+        this.finishEvent({ type: this.current.kind, ...(this.current.person ? { person: this.current.person } : {}), text: shown });
+        this.committed.push(this.current.kind === "dialogue" ? `${this.speakerLabelFor(this.current.person)}${IS_EN ? ": " : "："}${shown}` : shown);
+      }
+      return undefined;
+    }
+    const [event] = proseToEvents(line, this.speakers);
+    this.committed.push(line);
+    if (event) this.finishEvent(event);
+    else this.emittedText = "";
+    return undefined;
+  }
+
+  /** 当前未完成行里已经发出去的显示文本（丢行截断时用它收口）。 */
+  private emittedText = "";
+  private speakerLabelFor(person: string | undefined) {
+    return this.speakers.find((speaker) => (speaker.person ?? speaker.label) === person)?.label ?? person ?? "";
+  }
+
+  private finishEvent(event: FrontendEvent) {
+    const index = this.events.length;
+    this.events.push(event);
+    this.hooks.onEvent?.(index, event);
+    this.emittedText = "";
+  }
+
+  private partialLine(rawLine: string): string | undefined {
+    const line = rawLine.trim().replace(/^[>*\-–—]\s*/, "");
+    if (!line || this.current.poisoned) return undefined;
+    if (this.dedupe && this.couldBeDuplicatePrefix(line)) return undefined;
+    // 可校验的部分：英文去掉最后一个未写完的词（否则 "Ward" 会在 "Warden" 写到一半时误报）。
+    const checkable = IS_EN ? line.slice(0, Math.max(0, line.lastIndexOf(" "))) : line;
+    const leaked = checkable ? leakedTerm(checkable, this.forbidden) : undefined;
+    if (leaked) {
+      if (!this.dropOnLeak) return leaked;
+      this.current.poisoned = true;
+      return undefined;
+    }
+    let kind = this.current.kind;
+    let person = this.current.person;
+    let text: string;
+    const match = this.speakerPattern?.exec(line);
+    if (match) {
+      const speaker = this.speakers.find((entry) => entry.label.trim() === match[1]);
+      kind = "dialogue";
+      person = speaker?.person ?? speaker?.label ?? match[1];
+      text = match[2].trim().replace(/^[“"「]/, "");
+    } else if (kind === "narration" || /[：:]/.test(line) || line.length > this.maxLabelLength + 24) {
+      kind = "narration";
+      person = undefined;
+      text = line;
+    } else {
+      return undefined; // 还看不出是对白还是旁白，等下一段增量。
+    }
+    let safeLength = text.length - this.holdback;
+    if (IS_EN && safeLength > 0) safeLength = text.lastIndexOf(" ", safeLength);
+    if (safeLength <= this.current.emitted) return undefined;
+    const delta = text.slice(this.current.emitted, safeLength);
+    this.current = { emitted: safeLength, kind, person, poisoned: false };
+    this.emittedText = text.slice(0, safeLength);
+    this.hooks.onEventDelta?.(this.events.length, kind, person, delta);
+    return undefined;
+  }
+}
+
+export async function runTurn(pack: StoryPack, state: EngineState, recentScene: string, input: string, clicked: ClickedChoice | null, styleId?: string, hooks: TurnHooks = {}): Promise<TurnOutcome> {
   const notices: string[] = [];
   const routerNpcs = state.dynamic_npcs;
   let route: Record<string, unknown> = {};
@@ -504,42 +678,90 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
   }
   route = applyClickedMainline(pack, route, clicked, state.progress);
   const packet = makePacket(pack, route, state);
+  hooks.onRoute?.(packet);
   const currentIndex = currentAnchor(pack, packet.progress).segment_index;
   const forbidden = forbiddenTerms(pack, currentIndex);
+  const streamer = new LineStreamer(hooks.speakers?.(packet) ?? [], forbidden, hooks);
+  const reveal: RevealStats = { retries: 0, leaked: [], dropped: 0 };
 
+  const system = turnPrompt(packet, recentScene, input, state.game_state, styleId);
   let parsed: Record<string, unknown> = {};
-  let prose = "";
   let extraInstruction = "";
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await completion(turnPrompt(packet, recentScene, input, state.game_state, styleId), `${engineText.jsonOnly}${extraInstruction}`, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000 });
+    const continuation = streamer.committed.length > 0;
+    const lastAttempt = attempt === 2;
+    streamer.beginAttempt({ continuation, lastAttempt });
+    const user = `${engineText.jsonOnly}${extraInstruction}${continuation ? engineText.leakContinue(streamer.committed.join("\n")) : ""}`;
+    const abort = new AbortController();
+    let leaked: string | undefined;
+    let streamedProse = "";
+    const result = await completionStream(system, user, { temperature: 0.74, maxTokens: 2400, timeoutMs: 100000, signal: abort.signal }, (raw) => {
+      if (leaked) return;
+      const prose = scanProse(raw);
+      if (prose.length <= streamedProse.length && !proseClosed(raw)) return;
+      streamedProse = prose;
+      leaked = streamer.feed(prose, proseClosed(raw));
+      if (leaked) abort.abort();
+    });
+    if (leaked) {
+      // 这里只会在还能重试的尝试里到达（最后一次尝试改为丢行，不中止）。
+      notices.push(`writer_reveal_retry:${leaked}`);
+      reveal.retries += 1;
+      reveal.leaked.push(leaked);
+      extraInstruction = engineText.leakRetry(leaked);
+      continue;
+    }
     try {
-      parsed = jsonCandidates(response.raw);
+      parsed = jsonCandidates(result.raw);
     } catch (error) {
+      const finalProse = scanProse(result.raw);
+      if (finalProse.trim()) {
+        // 正文本身流完了，只是结构尾巴坏了：保住正文，其余字段走缺省。
+        notices.push(`writer_json_tail_recovered:${error instanceof Error ? error.message : String(error)}`);
+        streamer.feed(finalProse, true);
+        parsed = { prose: finalProse };
+        break;
+      }
+      if (streamer.committed.length) {
+        // 前缀已经发出去了，模型这次却什么都没给：不能整轮报错，以前缀收口。
+        notices.push(`writer_json_after_prefix:${error instanceof Error ? error.message : String(error)}`);
+        parsed = {};
+        break;
+      }
       notices.push(`writer_json_retry:${error instanceof Error ? error.message : String(error)}`);
       continue;
     }
-    prose = typeof parsed.prose === "string" ? parsed.prose.trim() : "";
-    if (!prose) { notices.push("writer_empty_prose_retry"); continue; }
-    const leaked = leakedTerm([prose, typeof parsed.handoff_snapshot === "string" ? parsed.handoff_snapshot : ""].join("\n"), forbidden);
-    if (leaked && attempt < 2) {
-      notices.push(`writer_reveal_retry:${leaked}`);
-      extraInstruction = engineText.leakRetry(leaked);
-      prose = "";
-      continue;
-    }
+    const attemptProse = typeof parsed.prose === "string" ? parsed.prose : "";
+    if (!attemptProse.trim() && !streamer.committed.length) { notices.push("writer_empty_prose_retry"); continue; }
+    // 用解析后的完整 prose 再喂一遍（流里最后一段 delta 可能还没触发 closed），保证所有行都收口。
+    streamer.feed(attemptProse, true);
     break;
   }
+  const prose = streamer.committed.join("\n").trim();
   if (!prose) throw new Error(engineText.emptyProse);
+  reveal.dropped = streamer.dropped;
+  if (streamer.dropped) notices.push(`writer_reveal_dropped_lines:${streamer.dropped}`);
   if (parsed.chapter_settled === true) notices.push("chapter_settled");
+
+  let handoff = typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : engineText.defaultHandoff;
+  const handoffLeak = leakedTerm(handoff, forbidden);
+  if (handoffLeak) {
+    // handoff 不给玩家看，但会投进下一轮 packet；带禁词的交接句换成缺省句，不为它重写已经发出的正文。
+    notices.push(`handoff_reveal_dropped:${handoffLeak}`);
+    reveal.handoff_dropped = handoffLeak;
+    handoff = engineText.defaultHandoff;
+  }
 
   return {
     packet: parsed.chapter_settled === true ? { ...packet, progress: settleChapter(pack, packet.progress) } : packet,
     prose,
-    handoff_snapshot: typeof parsed.handoff_snapshot === "string" && parsed.handoff_snapshot.trim() ? parsed.handoff_snapshot.trim() : engineText.defaultHandoff,
+    handoff_snapshot: handoff,
     choices: normaliseTurnChoices(pack, parsed.choice_sidecar, packet),
     game_state_delta: parsed.game_state && typeof parsed.game_state === "object" && !Array.isArray(parsed.game_state) ? parsed.game_state as Record<string, unknown> : undefined,
     state_cards: Array.isArray(parsed.state_cards) ? parsed.state_cards : [],
     notices,
     speaker_map: packet.on_stage_ids,
+    events: streamer.events,
+    reveal,
   };
 }

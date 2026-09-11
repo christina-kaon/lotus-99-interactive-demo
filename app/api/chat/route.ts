@@ -1,7 +1,15 @@
 /**
- * 逐轮接口（新链路）：P4a 回合路由 → packet → P4b 互动正文 → 确定性切成前端事件。
- * 前端契约不变：{ workflowToken, events[], choices[], current, present, visibleCharacters, responseContract,
- *                playerProfile, mediaCues, chapterComplete, transition, finaleVote }。
+ * 逐轮接口（新链路）：P4a 回合路由 → packet → P4b 互动正文（流式）→ 逐行切成前端事件。
+ * 响应是 application/x-ndjson 帧流（赵艺琛 09-11「lotus改一下流式吧」）：
+ *   {type:"route", present, engine}                       P4a 完成即发
+ *   {type:"event_delta", index, kind, person?, text}      当前事件的增量文本（已过禁词校验，不会撤回）
+ *   {type:"event", index, event}                          该事件收口（最终 person / text）
+ *   {type:"final", ...整包字段}                            与改流式前的整包 JSON 同字段：workflowToken, events, choices, current,
+ *                                                          present, visibleCharacters, responseContract, playerProfile, mediaCues,
+ *                                                          chapterComplete, finaleVote, transition, protocolNotice?, engine
+ *   {type:"ledger", workflowToken, ledger}                账本抽取收尾后重封的 token（前端以流里最后一个 token 为准）
+ *   {type:"error", message}
+ * 请求级错误（token 缺失 / 状态不允许）仍用普通 JSON + 状态码返回，不进流。
  */
 import type { Message, Person } from "../../story-data";
 import { cast as uiCast } from "../../story-data";
@@ -14,9 +22,9 @@ import {
   type SpeakerLabel,
 } from "../../engine/adapter";
 import { resolveMediaCues } from "../../engine/lotus-media";
-import { currentAnchor, displayName, extractLedger, runTurn } from "../../engine/runtime";
+import { currentAnchor, displayName, extractLedger, runTurn, type Packet } from "../../engine/runtime";
 import { styleProfile } from "../../engine/styles";
-import { clickedChoiceFromId, normaliseLedger, type EngineState } from "../../engine/state";
+import { clickedChoiceFromId, normaliseLedger, type EngineState, type SceneLedger } from "../../engine/state";
 import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
 import { openState, sealState } from "../../engine/token";
 import { responseContract } from "./contract";
@@ -127,76 +135,129 @@ export async function POST(request: Request) {
     const recentScene = recentSceneExcerpt(history, pack, workingState, previousIndex);
     const clicked = clickedChoiceFromId(body.choiceId);
 
-    const outcome = await runTurn(pack, workingState, recentScene, input, clicked, style.id);
-    const { packet } = outcome;
-    const anchor = currentAnchor(pack, packet.progress);
-    const currentIndex = anchor.segment_index;
-    const previousChapterId = state.progress.chapter_id;
-    const chapterChanged = packet.progress.chapter_id !== previousChapterId;
-    const activatedAnchorId = packet.mode === "activate_anchor" ? packet.selected_anchor_id : null;
+    // 以下全部在 ndjson 流里完成。请求级校验（token / 输入 / 状态）已在上面用普通 JSON 状态码回掉，
+    // 前端据此区分「请求没被接受」与「生成中途出错」（后者走 error 帧）。
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        let closed = false;
+        const emit = (frame: Record<string, unknown>) => {
+          if (closed) return;
+          try { controller.enqueue(encoder.encode(`${JSON.stringify(frame)}\n`)); } catch { closed = true; }
+        };
+        try {
+          // 身份已在正文里揭开（例如零点摘面罩）的角色，从这一轮起真名可用。
+          // 流式期间说话人标签按路由后的进度算（章末结算前）；final 的 present / visibleCharacters 仍按结算后的进度算。
+          const speakersFor = (packet: Packet) => {
+            const index = currentAnchor(pack, packet.progress).segment_index;
+            const npcNames = [...state.dynamic_npcs, ...(packet.new_npc ? [packet.new_npc] : [])].map((npc) => npc.name);
+            return speakerLabels(pack, workingState, index, publicCharacterIds(pack, index), npcNames);
+          };
+          const outcome = await runTurn(pack, workingState, recentScene, input, clicked, style.id, {
+            onRoute: (packet) => {
+              const routedAnchor = currentAnchor(pack, packet.progress);
+              const publicIds = publicCharacterIds(pack, routedAnchor.segment_index);
+              const onStageIds = packet.on_stage_ids.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
+              emit({
+                type: "route",
+                present: onStageIds.length ? onStageIds : routedAnchor.present.filter((id) => publicIds.includes(id)),
+                engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: routedAnchor.id, stage: packet.progress.stage, style: style.id },
+              });
+            },
+            speakers: speakersFor,
+            onEventDelta: (index, kind, person, text) => emit({ type: "event_delta", index, kind, ...(person ? { person } : {}), text }),
+            onEvent: (index, event) => emit({ type: "event", index, event }),
+          });
+          const { packet } = outcome;
+          const anchor = currentAnchor(pack, packet.progress);
+          const currentIndex = anchor.segment_index;
+          const previousChapterId = state.progress.chapter_id;
+          const chapterChanged = packet.progress.chapter_id !== previousChapterId;
+          const activatedAnchorId = packet.mode === "activate_anchor" ? packet.selected_anchor_id : null;
 
-    // 身份已在正文里揭开（例如零点摘面罩）的角色，从这一轮起真名可用。
-    const npcNames = [...state.dynamic_npcs, ...(packet.new_npc ? [packet.new_npc] : [])].map((npc) => npc.name);
-    const publicIds = publicCharacterIds(pack, currentIndex);
-    const events = proseToEvents(outcome.prose, speakerLabels(pack, workingState, currentIndex, publicIds, npcNames));
-    if (!events.length) throw new Error(engineText.noVisibleEvents);
+          const publicIds = publicCharacterIds(pack, currentIndex);
+          // 事件以流式期间逐行发出的为准（前端已经拿到同一份）；这里再按整段正文切一次只做一致性诊断。
+          const events = outcome.events;
+          if (!events.length) throw new Error(engineText.noVisibleEvents);
+          const npcNames = [...state.dynamic_npcs, ...(packet.new_npc ? [packet.new_npc] : [])].map((npc) => npc.name);
+          const recut = proseToEvents(outcome.prose, speakerLabels(pack, workingState, currentIndex, publicIds, npcNames));
+          const eventsConsistent = recut.length === events.length && recut.every((event, index) => event.text === events[index].text && event.type === events[index].type);
 
-    const media = resolveMediaCues(events, packet.progress.active_anchor_id, activatedAnchorId, state.played_media_ids);
-    const revealedIds = unique([...state.revealed_ids, ...media.reveals]) as Person[];
+          const media = resolveMediaCues(events, packet.progress.active_anchor_id, activatedAnchorId, state.played_media_ids);
+          const revealedIds = unique([...state.revealed_ids, ...media.reveals]) as Person[];
 
-    const finaleReady = Boolean(pack.finale_vote && packet.progress.active_anchor_id === pack.finale_vote.trigger_segment_id);
-    const finaleVote = finaleReady && !state.finale_ready ? finaleVotePayload(pack) : undefined;
-    const change = chapterChanged ? chapterChangePayload(pack, previousChapterId, packet.progress.chapter_id) : { chapterComplete: undefined, transition: undefined };
+          const finaleReady = Boolean(pack.finale_vote && packet.progress.active_anchor_id === pack.finale_vote.trigger_segment_id);
+          const finaleVote = finaleReady && !state.finale_ready ? finaleVotePayload(pack) : undefined;
+          const change = chapterChanged ? chapterChangePayload(pack, previousChapterId, packet.progress.chapter_id) : { chapterComplete: undefined, transition: undefined };
 
-    // 事件账本：以最终放行的正文（揭示门槛重试、事件切分、媒体触发都已过）为输入抽取并合并；失败沿用旧账本。
-    // Lotus 的状态封在 token 里随响应返回，所以这次小调用必须在封 token 之前完成（黑港是 final 帧后再发 ledger 帧）。
-    const onStageNames = packet.turn_context.on_stage_characters.map((character) => character.name);
-    const sceneLedger = await extractLedger(pack, outcome.prose, normaliseLedger(state.scene_ledger), onStageNames);
+          const previousLedger = normaliseLedger(state.scene_ledger);
+          const nextState = (sceneLedger: SceneLedger): EngineState => ({
+            ...workingState,
+            progress: packet.progress,
+            handoff_snapshot: outcome.handoff_snapshot,
+            seen_character_names: unique([...state.seen_character_names, ...packet.turn_context.on_stage_characters.map((character) => character.name)]),
+            dynamic_npcs: packet.new_npc ? [...state.dynamic_npcs, packet.new_npc] : state.dynamic_npcs,
+            game_state: outcome.game_state_delta ? { ...state.game_state, ...outcome.game_state_delta } : state.game_state,
+            played_media_ids: [...state.played_media_ids, ...media.cues.map((cue) => cue.id)],
+            revealed_ids: revealedIds,
+            completed_chapters: chapterChanged ? unique([...state.completed_chapters, previousChapterId]) : state.completed_chapters,
+            turns: state.turns + 1,
+            finale_ready: state.finale_ready || finaleReady,
+            scene_ledger: sceneLedger,
+          });
 
-    const nextState: EngineState = {
-      ...workingState,
-      progress: packet.progress,
-      handoff_snapshot: outcome.handoff_snapshot,
-      seen_character_names: unique([...state.seen_character_names, ...packet.turn_context.on_stage_characters.map((character) => character.name)]),
-      dynamic_npcs: packet.new_npc ? [...state.dynamic_npcs, packet.new_npc] : state.dynamic_npcs,
-      game_state: outcome.game_state_delta ? { ...state.game_state, ...outcome.game_state_delta } : state.game_state,
-      played_media_ids: [...state.played_media_ids, ...media.cues.map((cue) => cue.id)],
-      revealed_ids: revealedIds,
-      completed_chapters: chapterChanged ? unique([...state.completed_chapters, previousChapterId]) : state.completed_chapters,
-      turns: state.turns + 1,
-      finale_ready: state.finale_ready || finaleReady,
-      scene_ledger: sceneLedger,
-    };
+          const onStageIds = outcome.speaker_map.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
+          const present = onStageIds.length ? onStageIds : anchor.present.filter((id) => publicIds.includes(id));
+          const visibleCharacters = pack.cast.map((character) => character.id).filter((id) => publicIds.includes(id) && id in uiCast);
+          const notices = [...outcome.notices, ...(eventsConsistent ? [] : ["events_recut_mismatch"])];
 
-    const onStageIds = outcome.speaker_map.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
-    const present = onStageIds.length ? onStageIds : anchor.present.filter((id) => publicIds.includes(id));
-    const visibleCharacters = pack.cast.map((character) => character.id).filter((id) => publicIds.includes(id) && id in uiCast);
+          // final：整包字段全部在这里（前端拿它做一次权威对齐）。token 先按旧账本封——账本抽取是收尾的小调用，
+          // 不让它拖住选项出现；抽完再发 ledger 帧带重封的 token，前端以流里最后一个 token 为准。
+          emit({
+            type: "final",
+            workflowToken: await sealState(nextState(previousLedger)),
+            events,
+            choices: toFrontendChoices(outcome.choices),
+            current: { segmentId: anchor.id, chapterId: anchor.chapter_id, location: anchor.location },
+            present,
+            visibleCharacters,
+            responseContract,
+            playerProfile,
+            mediaCues: media.cues,
+            chapterComplete: change.chapterComplete,
+            finaleVote,
+            transition: change.transition,
+            ...(notices.length ? { protocolNotice: notices.join("; ") } : {}),
+            engine: {
+              chain: "storyforge-p4a-p4b",
+              mode: packet.mode,
+              anchor: anchor.id,
+              stage: packet.progress.stage,
+              style: style.id,
+              stateCards: outcome.state_cards,
+              /** 揭示门槛增量校验：续写次数 / 命中词 / 丢弃行数。 */
+              reveal: outcome.reveal,
+              /** 本轮写手实际读到的账本投影（新账本随 ledger 帧给）。 */
+              ledger: { projected: packet.turn_context.scene_ledger },
+            },
+          });
 
-    return Response.json({
-      workflowToken: await sealState(nextState),
-      events,
-      choices: toFrontendChoices(outcome.choices),
-      current: { segmentId: anchor.id, chapterId: anchor.chapter_id, location: anchor.location },
-      present,
-      visibleCharacters,
-      responseContract,
-      playerProfile,
-      mediaCues: media.cues,
-      chapterComplete: change.chapterComplete,
-      finaleVote,
-      transition: change.transition,
-      ...(outcome.notices.length ? { protocolNotice: outcome.notices.join("; ") } : {}),
-      engine: {
-        chain: "storyforge-p4a-p4b",
-        mode: packet.mode,
-        anchor: anchor.id,
-        stage: packet.progress.stage,
-        style: style.id,
-        stateCards: outcome.state_cards,
-        /** 本轮写手实际读到的账本投影 + 本轮抽取后的新账本（诊断用；前端不消费，状态以 token 为准）。 */
-        ledger: { projected: packet.turn_context.scene_ledger, next: { events_happened: sceneLedger.events, exited_characters: sceneLedger.exited } },
+          // 事件账本：以最终放行的正文为输入抽取并合并；失败沿用旧账本。
+          const onStageNames = packet.turn_context.on_stage_characters.map((character) => character.name);
+          const sceneLedger = await extractLedger(pack, outcome.prose, previousLedger, onStageNames);
+          emit({
+            type: "ledger",
+            workflowToken: await sealState(nextState(sceneLedger)),
+            ledger: { events_happened: sceneLedger.events, exited_characters: sceneLedger.exited },
+          });
+        } catch (error) {
+          emit({ type: "error", message: error instanceof Error ? error.message : "turn_failed" });
+        } finally {
+          try { controller.close(); } catch { /* 客户端已断开 */ }
+        }
       },
     });
+    return new Response(stream, { headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-cache", "x-accel-buffering": "no" } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "turn_failed";
     const status = message === "workflow_token_invalid" ? 409 : 502;

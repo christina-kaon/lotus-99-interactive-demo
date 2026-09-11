@@ -39,6 +39,7 @@ const en: Record<string, string> = {
   "本次身份": "Your identity",
   "你": "You",
   "本轮响应缺少剧情会话令牌": "This turn's response is missing the story session token",
+  "本轮生成中断，没有收到完整结果。": "This turn was cut off before the full result arrived.",
   "本轮生成失败，请重试。故事状态没有在页面中继续推进。": "This turn failed. Try again; the story has not advanced on the page.",
   "终局投票失败": "Final vote failed",
   "终局响应不完整": "Ending response incomplete",

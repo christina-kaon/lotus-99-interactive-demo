@@ -34,6 +34,8 @@ const zh = {
   /** 写手调用。 */
   jsonOnly: "只输出 JSON。",
   leakRetry: (leaked: string) => `上一稿在可见文本里出现了当前章节禁止公开的内容「${leaked}」，请保持同一场戏重写，让知情角色回避、掩饰或只说部分真话，不得让该信息出现在 prose 或 handoff_snapshot。`,
+  /** 流式重试：已发出的行锁定为前缀，只让写手续写（前缀原文附在后面）。 */
+  leakContinue: (prefix: string) => `\n以下正文已经展示给玩家、不可更改。prose 字段只写从这段之后继续的内容：不要重复、不要改写、不要复述其中任何一行，直接从下一行接着写，与之衔接自然，总长度与前缀合起来仍在本轮篇幅要求之内；handoff_snapshot、choice_sidecar 等其他字段按整场戏正常输出。\n【已发出的正文】\n${prefix}\n【从此处之后继续】`,
   emptyProse: "正文没有生成",
   defaultHandoff: "场内的安排尚未收束。",
   /** 故事包。 */
@@ -72,6 +74,7 @@ const en: typeof zh = {
   choiceLabelMax: 90,
   jsonOnly: "Output JSON only. All player-facing text must be in English.",
   leakRetry: (leaked: string) => `The previous draft exposed information that the current chapter forbids: "${leaked}". Rewrite the same scene so that the characters who know avoid it, cover for it, or tell only part of the truth. That information must not appear in prose or handoff_snapshot.`,
+  leakContinue: (prefix: string) => `\nThe following prose has already been shown to the player and cannot change. In the prose field write ONLY what comes after it: do not repeat, rewrite or paraphrase any of its lines; start directly with the next line so it reads as one continuous scene, keeping the combined length within this turn's word budget. Output handoff_snapshot, choice_sidecar and the other fields normally for the whole scene.\n[ALREADY SHOWN]\n${prefix}\n[CONTINUE FROM HERE]`,
   emptyProse: "No prose was generated",
   defaultHandoff: "Nothing in the room has been settled yet.",
   aliasRoleDaniel: "the anonymous DJ",

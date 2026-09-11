@@ -422,6 +422,8 @@ export default function Home() {
   const identityIntroSession = useRef("");
   const choiceWheelStartY = useRef<number | null>(null);
   const choiceWheelSelectionRef = useRef<number | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastFollowScrollAt = useRef(0);
   const [identityIntroQueued, setIdentityIntroQueued] = useState(false);
   const active = chapters[chapter] ?? chapters[0];
   const storyLocked = chapter === 0 && (!watchedVlog || !openingApplied);
@@ -495,29 +497,61 @@ export default function Home() {
 
   function finishVlog() { setVideoState("frame"); setWatchedVlog(true); }
 
-  async function typeScene(events: ProtocolEvent[], messageId: number, mediaCues: StoryMediaCue[] = []) {
-    for (let offset = 0; offset < events.length; offset += 1) {
-      const event = events[offset];
-      const fullText = event.text.trim();
-      if (!fullText) continue;
-      const nextId = `${messageId}-${event.id}-${offset}`;
-      const message: UiMessage = { id: nextId, text: "", eventType: event.type, ...(event.person ? { person: event.person } : { kind: "system" }) };
-      setMessages((current) => [...current, message]); setStreamingId(nextId);
-      for (let cursor = 2; cursor < fullText.length + 2; cursor += 2) {
-        const visibleText = fullText.slice(0, cursor);
-        setMessages((current) => current.map((item) => item.id === nextId ? { ...item, text: visibleText } : item));
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 18));
-      }
-      setStreamingId(null);
-      const imageCue = mediaCues.find((cue) => cue.kind === "image" && cue.eventIndex === offset);
-      if (imageCue) {
-        setMessages((current) => current.map((item) => item.id === nextId
-          ? { ...item, media: { url: imageCue.url, alt: imageCue.alt ?? t("剧情影像"), ...(imageCue.caption ? { caption: imageCue.caption } : {}) } }
-          : item));
-      }
-      if (mediaCues.some((cue) => cue.kind === "audio" && cue.id === "ch02-childhood-song" && cue.eventIndex === offset)) void playChildhoodSong();
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 160));
-    }
+  /** 流式期间跟随滚动：节流到 ~200ms，不为每个 delta 都 scrollIntoView（会抖）。 */
+  function followScroll(force = false) {
+    const now = Date.now();
+    if (!force && now - lastFollowScrollAt.current < 200) return;
+    lastFollowScrollAt.current = now;
+    window.requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end" }));
+  }
+
+  function streamMessageId(turnId: number, index: number) { return `${turnId}-ev-${index}`; }
+
+  /** event_delta：当前事件的占位气泡（没有就建，有就追加增量）。 */
+  function appendStreamDelta(turnId: number, index: number, kind: EventType, person: string | undefined, delta: string) {
+    const id = streamMessageId(turnId, index);
+    setMessages((current) => {
+      const existing = current.find((item) => item.id === id);
+      if (existing) return current.map((item) => item.id === id ? { ...item, text: item.text + delta } : item);
+      return [...current, { id, text: delta, eventType: kind, ...(person ? { person } : { kind: "system" as const }) }];
+    });
+    setStreamingId(id);
+    followScroll();
+  }
+
+  /** event：该事件收口，占位气泡转正式气泡（person / 文本以服务端最终切分为准）。 */
+  function settleStreamEvent(turnId: number, index: number, event: ProtocolEvent) {
+    const id = streamMessageId(turnId, index);
+    const settled: UiMessage = { id, text: event.text, eventType: event.type, ...(event.person ? { person: event.person } : { kind: "system" as const }) };
+    setMessages((current) => current.some((item) => item.id === id) ? current.map((item) => item.id === id ? settled : item) : [...current, settled]);
+    setStreamingId((current) => current === id ? null : current);
+    followScroll();
+  }
+
+  /** final：用整包 events 做一次权威对齐（补上流里没到的行、替换文本），再挂媒体、放音频。 */
+  function applyFinalScene(turnId: number, events: ProtocolEvent[], mediaCues: StoryMediaCue[]) {
+    setMessages((current) => {
+      const ids = new Set(events.map((_, index) => streamMessageId(turnId, index)));
+      const kept = current.filter((item) => !(typeof item.id === "string" && item.id.startsWith(`${turnId}-ev-`) && !ids.has(item.id)));
+      const next = [...kept];
+      events.forEach((event, index) => {
+        const id = streamMessageId(turnId, index);
+        const imageCue = mediaCues.find((cue) => cue.kind === "image" && cue.eventIndex === index);
+        const message: UiMessage = {
+          id,
+          text: event.text,
+          eventType: event.type,
+          ...(event.person ? { person: event.person } : { kind: "system" as const }),
+          ...(imageCue ? { media: { url: imageCue.url, alt: imageCue.alt ?? t("剧情影像"), ...(imageCue.caption ? { caption: imageCue.caption } : {}) } } : {}),
+        };
+        const at = next.findIndex((item) => item.id === id);
+        if (at >= 0) next[at] = message; else next.push(message);
+      });
+      return next;
+    });
+    setStreamingId(null);
+    if (mediaCues.some((cue) => cue.kind === "audio" && cue.id === "ch02-childhood-song")) void playChildhoodSong();
+    followScroll(true);
   }
 
   async function playChildhoodSong() {
@@ -555,23 +589,67 @@ export default function Home() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, history: historySnapshot, input: trimmed, inputKind: choice.kind, style_id: styleId, ...(playerProfile ? { playerProfile } : {}), ...("id" in choice && choice.id ? { choiceId: choice.id } : {}) }),
       });
-      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-      if (!response.ok) throw new Error(firstString(payload.error) ?? ui.turnFailedHttp(response.status));
-      const nextWorkflowToken = firstString(payload.workflowToken);
-      if (!nextWorkflowToken) throw new Error(t("本轮响应缺少剧情会话令牌"));
-      setWorkflowToken(nextWorkflowToken);
-      const updatedPlayerProfile = firstString(payload.playerProfile, payload.player_profile)?.trim();
+      if (!response.ok || !response.body) {
+        const failure = await response.json().catch(() => ({})) as Record<string, unknown>;
+        throw new Error(firstString(failure.error) ?? ui.turnFailedHttp(response.status));
+      }
+      // ndjson 帧流：route → event_delta* → event* → final → ledger；error 帧走现有错误提示。
+      const received: { final?: Record<string, unknown>; token: string } = { token: "" };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const handleFrame = (frame: Record<string, unknown>) => {
+        const type = firstString(frame.type);
+        if (type === "event_delta") {
+          const index = Number(frame.index);
+          const delta = typeof frame.text === "string" ? frame.text : "";
+          if (!Number.isInteger(index) || index < 0 || !delta) return;
+          const kind = frame.kind === "dialogue" ? "dialogue" : "narration";
+          appendStreamDelta(id, index, kind, firstString(frame.person), delta);
+        } else if (type === "event") {
+          const index = Number(frame.index);
+          const [event] = normalizeEvents(frame.event, `turn-${id}-${index}`);
+          if (Number.isInteger(index) && index >= 0 && event) settleStreamEvent(id, index, event);
+        } else if (type === "final") {
+          received.final = frame;
+          const token = firstString(frame.workflowToken);
+          if (token) received.token = token;
+        } else if (type === "ledger") {
+          const token = firstString(frame.workflowToken);
+          if (token) received.token = token;
+        } else if (type === "error") {
+          throw new Error(firstString(frame.message) ?? t("本轮生成失败，请重试。故事状态没有在页面中继续推进。"));
+        }
+      };
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        buffer += decoder.decode(part.value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          handleFrame(JSON.parse(line) as Record<string, unknown>);
+        }
+      }
+      if (buffer.trim()) handleFrame(JSON.parse(buffer) as Record<string, unknown>);
+      if (!received.final) throw new Error(t("本轮生成中断，没有收到完整结果。"));
+      const finalPayload = received.final;
+      if (!received.token) throw new Error(t("本轮响应缺少剧情会话令牌"));
+      setWorkflowToken(received.token);
+      const updatedPlayerProfile = firstString(finalPayload.playerProfile, finalPayload.player_profile)?.trim();
       if (updatedPlayerProfile && updatedPlayerProfile !== playerProfile) {
         setPlayerProfile(updatedPlayerProfile);
         setPlayerRoleDraft(updatedPlayerProfile);
       }
-      const events = normalizeEvents(payload.events, `turn-${id}`);
-      const contract = responseContract(payload.responseContract ?? payload.response_contract ?? turnContract);
+      const events = normalizeEvents(finalPayload.events, `turn-${id}`);
+      const contract = responseContract(finalPayload.responseContract ?? finalPayload.response_contract ?? turnContract);
       if (events.length < contract.minEvents || events.length > contract.maxEvents) throw new Error(ui.eventCountMismatch(events.length, contract.minEvents, contract.maxEvents));
-      const controls = responseControls(payload);
-      const mediaCues = normalizeMediaCues(payload);
+      const controls = responseControls(finalPayload);
+      const mediaCues = normalizeMediaCues(finalPayload);
       if (controls.choices.length !== contract.choiceCount) throw new Error(ui.choiceCountMismatch(controls.choices.length, contract.choiceCount));
-      await typeScene(events, id, mediaCues);
+      applyFinalScene(id, events, mediaCues);
+      const payload = finalPayload;
       if (controls.wildcardSpeech.length) sessionWildcardSpeech.current = controls.wildcardSpeech;
       setLiveChoices(controls.choices);
       setWildcardSpeech(sessionWildcardSpeech.current);
@@ -835,7 +913,7 @@ export default function Home() {
         if (eventType !== "dialogue" || !message.person) return <article className={`narration-block event-${eventType} ${streaming}`} key={message.id}><p className="narration">{message.text}</p>{message.media && <StoryEventMedia media={message.media} />}</article>;
         const entry = characters[message.person] ?? { id: message.person, name: message.person, role: t("故事角色"), bio: t("角色资料尚未公开。") };
         return <article className={`dialogue event-${eventType} ${streaming}`} key={message.id}><Avatar actor={message.person} characters={characters} onOpen={setSelectedPerson} /><div className="npc-copy"><header><b>{entry.name}</b></header><p>{message.text}</p>{message.media && <StoryEventMedia media={message.media} />}</div></article>;
-      })}</div>{blockedStoryAudioCue && <button className="story-audio-fallback" type="button" onClick={resumeChildhoodSong}><span aria-hidden="true">♪</span><b>{t("播放旧音响里的童年旋律")}</b><small>{t("断续、失真，像一张转坏的旧唱片")}</small></button>}{storyLocked ? <><p className={`watch-note ${workflowStatus === "error" ? "protocol-error" : ""}`}>{!watchedVlog ? t("先播放完玛雅的 Vlog，看看在场的人各自看见了什么。") : waitingForOpening ? t("Vlog 已播放，正在等待 Prompt 1/2 返回锁定开场……") : workflowStatus === "error" ? ui.compileFailedWith(workflowError || t("未知错误")) : t("正在装载锁定开场……")}</p>{playerRoleControl}</> : <>{turnError && <div className="protocol-error turn-error" role="alert"><b>{t("本轮没有通过协议")}</b><span>{turnError}</span><button type="button" onClick={() => setTurnError("")}>{t("知道了")}</button></div>}{identityIntroBlocking && <p className="narration typing">{t("正在让在场的人认识你……")}</p>}{chapterEndingPause && <p className="narration typing">{t("本章最后的画面还停在这里……")}</p>}{pending && streamingId === null && !chapterEndingPause && <p className="narration typing">{t("正在生成一整段电影探索场景……")}</p>}{playerRoleControl}<div className="interaction-dock"><form className="composer" onSubmit={submit}><input aria-label={t("输入你的行动或判断")} value={input} onChange={(event) => setInput(event.target.value)} placeholder={compiledOpening?.joinHint ?? t("说说你的判断，或者直接问一个人…")} disabled={pending || identityIntroBlocking} /><button type="submit" disabled={pending || identityIntroBlocking || !input.trim()}>{t("发送")} <span>↵</span></button></form>{liveChoices.length > 0 && !identityIntroBlocking && <div className={`choice-wheel-shell ${choiceWheelOpen ? "is-open" : ""} ${choiceWheelSelection !== null ? `is-selecting-${choiceWheelSelection}` : ""}`}><div className="choice-wheel-popover" id="story-choice-wheel" aria-hidden={!choiceWheelOpen && choiceWheelSelection === null}>{liveChoices.map((choice, index) => <button type="button" disabled={pending} className={choiceWheelSelection === index ? "is-selected" : ""} key={choice.id ?? `${choice.text}-${index}`} onClick={() => void send(choice)}><span>{choice.text}</span></button>)}{wildcardSpeech.length > 0 && <button type="button" className="choice-wheel-random" aria-label={t("掷骰子，随机说一句协议提供的话")} disabled={pending} onClick={() => void send(wildcardSpeech[Math.floor(Math.random() * wildcardSpeech.length)])}><span>{t("🎲 随机回答")}</span></button>}</div><button type="button" className="choice-wheel" aria-label={t("剧情转盘：点击展开，上下拖动并松手直接发送")} aria-expanded={choiceWheelOpen} aria-controls="story-choice-wheel" disabled={pending} onPointerDown={beginWheelDrag} onPointerMove={moveWheelDrag} onPointerUp={endWheelDrag} onPointerCancel={cancelWheelDrag} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setChoiceWheelOpen((open) => !open); } }}><span aria-hidden="true">Ⅰ</span><b>{t("选择")}</b><span aria-hidden="true">Ⅱ</span></button></div>}</div></>}</section>
+      })}<div ref={messagesEndRef} aria-hidden="true" /></div>{blockedStoryAudioCue && <button className="story-audio-fallback" type="button" onClick={resumeChildhoodSong}><span aria-hidden="true">♪</span><b>{t("播放旧音响里的童年旋律")}</b><small>{t("断续、失真，像一张转坏的旧唱片")}</small></button>}{storyLocked ? <><p className={`watch-note ${workflowStatus === "error" ? "protocol-error" : ""}`}>{!watchedVlog ? t("先播放完玛雅的 Vlog，看看在场的人各自看见了什么。") : waitingForOpening ? t("Vlog 已播放，正在等待 Prompt 1/2 返回锁定开场……") : workflowStatus === "error" ? ui.compileFailedWith(workflowError || t("未知错误")) : t("正在装载锁定开场……")}</p>{playerRoleControl}</> : <>{turnError && <div className="protocol-error turn-error" role="alert"><b>{t("本轮没有通过协议")}</b><span>{turnError}</span><button type="button" onClick={() => setTurnError("")}>{t("知道了")}</button></div>}{identityIntroBlocking && <p className="narration typing">{t("正在让在场的人认识你……")}</p>}{chapterEndingPause && <p className="narration typing">{t("本章最后的画面还停在这里……")}</p>}{pending && streamingId === null && !chapterEndingPause && <p className="narration typing">{t("正在生成一整段电影探索场景……")}</p>}{playerRoleControl}<div className="interaction-dock"><form className="composer" onSubmit={submit}><input aria-label={t("输入你的行动或判断")} value={input} onChange={(event) => setInput(event.target.value)} placeholder={compiledOpening?.joinHint ?? t("说说你的判断，或者直接问一个人…")} disabled={pending || identityIntroBlocking} /><button type="submit" disabled={pending || identityIntroBlocking || !input.trim()}>{t("发送")} <span>↵</span></button></form>{liveChoices.length > 0 && !identityIntroBlocking && <div className={`choice-wheel-shell ${choiceWheelOpen ? "is-open" : ""} ${choiceWheelSelection !== null ? `is-selecting-${choiceWheelSelection}` : ""}`}><div className="choice-wheel-popover" id="story-choice-wheel" aria-hidden={!choiceWheelOpen && choiceWheelSelection === null}>{liveChoices.map((choice, index) => <button type="button" disabled={pending} className={choiceWheelSelection === index ? "is-selected" : ""} key={choice.id ?? `${choice.text}-${index}`} onClick={() => void send(choice)}><span>{choice.text}</span></button>)}{wildcardSpeech.length > 0 && <button type="button" className="choice-wheel-random" aria-label={t("掷骰子，随机说一句协议提供的话")} disabled={pending} onClick={() => void send(wildcardSpeech[Math.floor(Math.random() * wildcardSpeech.length)])}><span>{t("🎲 随机回答")}</span></button>}</div><button type="button" className="choice-wheel" aria-label={t("剧情转盘：点击展开，上下拖动并松手直接发送")} aria-expanded={choiceWheelOpen} aria-controls="story-choice-wheel" disabled={pending} onPointerDown={beginWheelDrag} onPointerMove={moveWheelDrag} onPointerUp={endWheelDrag} onPointerCancel={cancelWheelDrag} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setChoiceWheelOpen((open) => !open); } }}><span aria-hidden="true">Ⅰ</span><b>{t("选择")}</b><span aria-hidden="true">Ⅱ</span></button></div>}</div></>}</section>
       {selectedPerson && selectedCharacter && <div className="profile-overlay" role="dialog" aria-modal="true" aria-label={ui.characterCard(selectedCharacter.name)} onClick={() => setSelectedPerson(null)}><section className={`profile-card ${/^[-_a-z0-9]+$/i.test(selectedPerson) ? `profile-${selectedPerson}` : ""}`} onClick={(event) => event.stopPropagation()}><button className="profile-close" onClick={() => setSelectedPerson(null)} aria-label={t("关闭角色卡")}>×</button>{selectedCharacter.image ? <img src={selectedCharacter.image} alt={selectedCharacter.name} /> : <div className="profile-placeholder">{selectedCharacter.name.slice(0, 1)}</div>}<span>{selectedCharacter.role}</span><h2>{selectedCharacter.name}</h2><p>{selectedCharacter.bio}</p></section></div>}
       {chapterComplete && <div className="chapter-complete-overlay" role="dialog" aria-modal="true" aria-labelledby="chapter-complete-title">
         <section className="chapter-complete-card">
