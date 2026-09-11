@@ -16,6 +16,22 @@ export type DynamicNpc = { name: string; relationship: string; profile: string }
 
 export type ClickedChoice = { kind: "mainline" | "deepen" | "freeplay"; anchor_id: string | null };
 
+/**
+ * 事件账本（赵艺琛 09-11：「已发生的事、已离场的人跨轮记住再投给写手」）。
+ * events：此前各轮已完成的事实（最多 12 条，最近优先）；exited：已离场、此刻不在场的角色真名（最多 8 人）。
+ * 随 EngineState 封进 workflowToken 往返；每轮正文放行后由一次小调用抽取更新（见 runtime.extractLedger）。
+ */
+export type SceneLedger = { events: string[]; exited: string[] };
+export const EMPTY_LEDGER: SceneLedger = { events: [], exited: [] };
+
+export function normaliseLedger(value: unknown): SceneLedger {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const strings = (input: unknown, limit: number) => Array.isArray(input)
+    ? [...new Set(input.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()))].slice(-limit)
+    : [];
+  return { events: strings(record.events, 12), exited: strings(record.exited, 8) };
+}
+
 export type EngineState = {
   v: 2;
   story: string;
@@ -33,6 +49,8 @@ export type EngineState = {
   turns: number;
   finale_ready: boolean;
   finale_choice?: "destroy" | "preserve";
+  /** 可选：引入账本前签发的 token 没有这个字段，openState 后用 normaliseLedger 补成空账本。 */
+  scene_ledger?: SceneLedger;
 };
 
 export function initialState(pack: StoryPack): EngineState {
@@ -63,6 +81,7 @@ export function initialState(pack: StoryPack): EngineState {
     completed_chapters: [],
     turns: 0,
     finale_ready: false,
+    scene_ledger: { events: [], exited: [] },
   };
 }
 

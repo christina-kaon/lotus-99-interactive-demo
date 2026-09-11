@@ -103,3 +103,17 @@ export const writerLanguageAddendum = IS_EN
 All player-facing generated fields—prose, handoff_snapshot, choice labels, state card label/title/summary/entries, game-state strings, character names, and narration—must be idiomatic English only. Do not output Chinese or mixed-language text, even if input history contains Chinese.
 The prose length rule "650–800 Chinese characters" maps to 450–600 English words for this story. Keep the screenplay layout for dialogue: "Name: line", using the English character names exactly as given in on_stage_characters. Address the player as "you".`
   : "";
+
+/**
+ * 事件账本（赵艺琛 09-11）。运行层自己的两段文本，不改 wiki 里的 P4b 正文：
+ *   ledgerDirective —— 追加在 P4b 模板（及语言指令）之后，告诉写手已发生的事不得重演、已离场者无新入场不得出现；
+ *   ledgerExtractionPrompt —— 每轮正文放行后那次小调用的 system prompt，从正文抽已完成事实 / 离场 / 入场。
+ * 文本与 storyforge（黑港）b0e4386 同源。
+ */
+export const ledgerDirective = IS_EN
+  ? "\n\n[Scene ledger — runtime projection] turn_packet.turn_context.scene_ledger.events_happened lists things that already happened and were completed in earlier turns (object handovers, promises, orders, decisions, exits, entrances): never replay them or write them as if they had not happened yet; refer to them only as settled facts and move on from them. scene_ledger.exited_characters are people who have left and are not present now: unless on_stage_characters explicitly includes such a person and the prose writes a fresh entrance, give them no lines, actions or glances."
+  : "\n\n【事件账本（运行层投影）】turn_packet.turn_context.scene_ledger.events_happened 是此前各轮已经真实发生并完成的事（物件转移、承诺、命令、决定、离场、入场）：不得重演、不得当作尚未发生再写一遍，只能作为已成立的前提被提及或顺着往下走。scene_ledger.exited_characters 是已经离开现场、此刻不在场的人：除非 on_stage_characters 明确含此人并且正文写出新的入场动作，否则不得出现其台词、动作或视线。";
+
+export const ledgerExtractionPrompt = IS_EN
+  ? "You are the runtime's event clerk; you write no prose. Read one passage of interactive fiction, the previous ledger and the on-stage list, and output valid JSON only: {\"events_happened\":[\"…\"],\"exited_characters\":[\"…\"],\"entered_characters\":[\"…\"]}. events_happened: 0–4 facts from this passage that are completed and change what follows (object handovers, promises, orders, decisions, exits, entrances), one sentence each, at most 15 words, using characters' real names, no emotions, no guesses, nothing already in the previous ledger; empty array if none. exited_characters: only real names of characters who clearly leave the scene in this passage. entered_characters: only real names of characters who clearly enter. Never record anything the passage does not contain."
+  : "你是运行层的事件记录员，不写正文。读入一段互动小说正文、上一轮账本与在场名单，只输出合法 JSON：{\"events_happened\":[\"…\"],\"exited_characters\":[\"…\"],\"entered_characters\":[\"…\"]}。events_happened：0–4 条本段里已经完成、会改变后续局面的事实（物件转移、承诺、命令、决定、离场、入场），每条一句、不超过 30 字、用角色真名、不写情绪不写猜测、不重复上一轮账本已有的事；没有就给空数组。exited_characters：只写本段明确离开现场的角色真名。entered_characters：只写本段明确进入现场的角色真名。正文里没有的事一律不写。";

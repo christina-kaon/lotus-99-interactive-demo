@@ -10,7 +10,7 @@ export function apiKey() {
   return process.env.KAON_API_KEY || process.env.DEEPSEEK_API_KEY || "";
 }
 
-export async function completion(system: string, user: string, options: { temperature: number; maxTokens: number; timeoutMs: number; jsonMode?: boolean }) {
+export async function completion(system: string, user: string, options: { temperature: number; maxTokens: number; timeoutMs: number; jsonMode?: boolean; reasoningEffort?: "low" | "medium" | "high" }) {
   const key = apiKey();
   if (!key) throw new Error("missing_api_key");
   const request = async (jsonMode: boolean) => {
@@ -26,6 +26,8 @@ export async function completion(system: string, user: string, options: { temper
           messages: [{ role: "system", content: system }, { role: "user", content: user }],
           temperature: options.temperature,
           max_tokens: options.maxTokens,
+          // 账本抽取这类小调用压低隐藏推理（Gemini 3.7 flash 默认会烧 ~2k 推理 token，700 的预算会被吃空）。
+          ...(options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
           ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
         }),
       });

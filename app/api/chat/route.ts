@@ -14,9 +14,9 @@ import {
   type SpeakerLabel,
 } from "../../engine/adapter";
 import { resolveMediaCues } from "../../engine/lotus-media";
-import { currentAnchor, displayName, runTurn } from "../../engine/runtime";
+import { currentAnchor, displayName, extractLedger, runTurn } from "../../engine/runtime";
 import { styleProfile } from "../../engine/styles";
-import { clickedChoiceFromId, type EngineState } from "../../engine/state";
+import { clickedChoiceFromId, normaliseLedger, type EngineState } from "../../engine/state";
 import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
 import { openState, sealState } from "../../engine/token";
 import { responseContract } from "./contract";
@@ -148,6 +148,11 @@ export async function POST(request: Request) {
     const finaleVote = finaleReady && !state.finale_ready ? finaleVotePayload(pack) : undefined;
     const change = chapterChanged ? chapterChangePayload(pack, previousChapterId, packet.progress.chapter_id) : { chapterComplete: undefined, transition: undefined };
 
+    // 事件账本：以最终放行的正文（揭示门槛重试、事件切分、媒体触发都已过）为输入抽取并合并；失败沿用旧账本。
+    // Lotus 的状态封在 token 里随响应返回，所以这次小调用必须在封 token 之前完成（黑港是 final 帧后再发 ledger 帧）。
+    const onStageNames = packet.turn_context.on_stage_characters.map((character) => character.name);
+    const sceneLedger = await extractLedger(pack, outcome.prose, normaliseLedger(state.scene_ledger), onStageNames);
+
     const nextState: EngineState = {
       ...workingState,
       progress: packet.progress,
@@ -160,6 +165,7 @@ export async function POST(request: Request) {
       completed_chapters: chapterChanged ? unique([...state.completed_chapters, previousChapterId]) : state.completed_chapters,
       turns: state.turns + 1,
       finale_ready: state.finale_ready || finaleReady,
+      scene_ledger: sceneLedger,
     };
 
     const onStageIds = outcome.speaker_map.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
@@ -180,7 +186,16 @@ export async function POST(request: Request) {
       finaleVote,
       transition: change.transition,
       ...(outcome.notices.length ? { protocolNotice: outcome.notices.join("; ") } : {}),
-      engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: anchor.id, stage: packet.progress.stage, style: style.id, stateCards: outcome.state_cards },
+      engine: {
+        chain: "storyforge-p4a-p4b",
+        mode: packet.mode,
+        anchor: anchor.id,
+        stage: packet.progress.stage,
+        style: style.id,
+        stateCards: outcome.state_cards,
+        /** 本轮写手实际读到的账本投影 + 本轮抽取后的新账本（诊断用；前端不消费，状态以 token 为准）。 */
+        ledger: { projected: packet.turn_context.scene_ledger, next: { events_happened: sceneLedger.events, exited_characters: sceneLedger.exited } },
+      },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "turn_failed";

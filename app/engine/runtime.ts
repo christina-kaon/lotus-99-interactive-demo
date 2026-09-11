@@ -7,16 +7,18 @@ import P4A_TEMPLATE from "../prompts/p4a";
 import P4B_TEMPLATE from "../prompts/p4b";
 import { IS_EN } from "../locale";
 import { styleProfile } from "./styles";
-import { engineText, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
+import { engineText, ledgerDirective, ledgerExtractionPrompt, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
 import { completion, jsonCandidates } from "./kaon";
 import {
   normaliseClickedChoice,
+  normaliseLedger,
   normaliseNewNpc,
   normaliseProgress,
   type ClickedChoice,
   type DynamicNpc,
   type EngineState,
   type Progress,
+  type SceneLedger,
 } from "./state";
 import { STAGES, type PackAnchor, type PackCharacter, type StoryPack } from "./story-pack";
 
@@ -54,9 +56,17 @@ const styleTurn = (styleId?: string) => {
   return { turn_directive: style.directive, few_shots: style.few_shots };
 };
 
-/** P4a / P4b 提示词本体不翻译；英文版只在末尾追加输出语言指令（中文版追加空串，逐字不变）。 */
+/**
+ * P4a / P4b 提示词本体不翻译；英文版只在末尾追加输出语言指令（中文版追加空串，逐字不变）。
+ * P4b 之后再追加运行层自己的事件账本指令（zh/en 各一段，不动 wiki 正文）。
+ */
 const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}`;
-const WRITER_TEMPLATE = `${P4B_TEMPLATE}${writerLanguageAddendum}`;
+const WRITER_TEMPLATE = `${P4B_TEMPLATE}${writerLanguageAddendum}${ledgerDirective}`;
+
+/** 投给 P4a 输入与 P4b packet 的账本投影（events 只带最近 8 条）。 */
+function ledgerProjection(ledger: SceneLedger) {
+  return { events_happened: ledger.events.slice(-8), exited_characters: ledger.exited };
+}
 
 export function anchorById(pack: StoryPack, id: string | null | undefined) {
   return id ? pack.anchors.find((anchor) => anchor.id === id) : undefined;
@@ -245,7 +255,10 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
   const stagedNames = [...new Set([...(newNpc ? [newNpc.name] : []), ...requestedNames])].slice(0, 3);
   // P4a 明确输出空 character_names 表示玩家要独处；只有它什么都没给时才回落到本段 present。
   const routerChoseNobody = Array.isArray(selection.character_names) && selection.character_names.length === 0;
-  const finalNames = stagedNames.length ? stagedNames : routerChoseNobody ? [] : defaultNames;
+  const finalNamesBeforeLedger = stagedNames.length ? stagedNames : routerChoseNobody ? [] : defaultNames;
+  // 账本里已离场的人从名单里剔掉；只有 P4a 明确点名才回来（视为新入场）。
+  const ledger = normaliseLedger(state.scene_ledger);
+  const finalNames = finalNamesBeforeLedger.filter((name) => !ledger.exited.includes(name) || requestedNames.includes(name));
   const onStage = finalNames.flatMap((name) => known.get(name) ? [known.get(name)!] : []);
 
   const relationships = [
@@ -314,6 +327,7 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
       },
       choice_guide: mainline ? { anchor_id: mainline.id, direction: mainline.content } : null,
       handoff: state.handoff_snapshot,
+      scene_ledger: ledgerProjection(ledger),
     },
     on_stage_ids: onStage.map((character) => ({ label: character.name, person: character.id })),
   };
@@ -343,7 +357,43 @@ function routerInput(pack: StoryPack, state: EngineState, recentScene: string, i
     textures: pack.texture_pool.map((content, index) => ({ index, content })),
     relationship_memory: baseRelationshipMemory(pack, state, currentIndex).map((memory, index) => ({ index, ...memory })),
     dynamic_npcs: routerNpcs,
+    scene_ledger: ledgerProjection(normaliseLedger(state.scene_ledger)),
   };
+}
+
+/**
+ * 每轮正文最终放行（揭示门槛重试、事件切分之后）再调一次小模型，从正文抽已完成事实 / 离场 / 入场并合并进账本。
+ * 离场与入场只认故事包里六位角色的真名（别名如「零点」映射回真身），动态 NPC 与臆造名一律丢弃。
+ * 任何失败都沿用旧账本——账本是增强，绝不能让这一轮报错。
+ */
+export async function extractLedger(pack: StoryPack, prose: string, previous: SceneLedger, onStageNames: string[]): Promise<SceneLedger> {
+  try {
+    const response = await completion(ledgerExtractionPrompt, JSON.stringify({
+      prose,
+      previous_ledger: ledgerProjection(previous),
+      on_stage_characters: onStageNames,
+      known_characters: pack.cast.map((character) => character.name),
+    }), { temperature: 0, maxTokens: 700, timeoutMs: 30000, reasoningEffort: "low" });
+    const parsed = jsonCandidates(response.raw);
+    const strings = (input: unknown) => Array.isArray(input) ? input.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [];
+    const realName = (raw: string) => {
+      const needle = raw.normalize("NFKC").toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+      const character = pack.cast.find((entry) => [entry.name, ...entry.aliases].some((name) => name.normalize("NFKC").toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "") === needle));
+      return character?.name;
+    };
+    const castNames = (input: unknown) => [...new Set(strings(input).flatMap((raw) => { const name = realName(raw); return name ? [name] : []; }))];
+    const events = strings(parsed.events_happened).map((event) => event.slice(0, 80)).slice(0, 4);
+    const exitedNow = castNames(parsed.exited_characters);
+    const enteredNow = castNames(parsed.entered_characters);
+    // 本轮被路由排上场、或正文里明确入场的人视为回到现场；本轮明确离场的人加入 exited。
+    const exited = [...new Set([
+      ...previous.exited.filter((name) => !enteredNow.includes(name) && !onStageNames.includes(name)),
+      ...exitedNow,
+    ])].slice(-8);
+    return { events: [...new Set([...previous.events, ...events])].slice(-12), exited };
+  } catch {
+    return previous;
+  }
 }
 
 function turnPrompt(packet: Packet, recentScene: string, input: string, gameState: Record<string, unknown>, styleId?: string) {
