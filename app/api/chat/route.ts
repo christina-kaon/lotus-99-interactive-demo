@@ -30,9 +30,11 @@ const playerInputKinds = new Set(["action", "speech", "freeform", "identity"]);
 /** 与旧链路相同的“我是 X / 我改成 X”身份声明识别（中文原文照搬；英文版换成 "I am X / I'll play X / call me X"）。 */
 const identityPatterns = IS_EN
   ? [
-    /^i(?:'m| am) (.{1,40}?)[.!]?$/iu,
-    /^i(?:'ll| will)? (?:now )?(?:play(?: as)?|be|become|switch to) (.{1,40}?)(?: now)?[.!]?$/iu,
-    /^(?:from now on,? )?(?:i am|i'm|call me|treat me as|consider me) (.{1,40}?)[.!]?$/iu,
+    // 英文里 "I am X" 是日常句式（I am worried…），不当身份声明；只认带明确扮演/改名意图的句式。
+    /^(?:i(?:'ll| will) )?(?:now )?play(?: as)? (.{1,40}?)(?: now)?[.!]?$/iu,
+    /^i(?:'ll| will) (?:now )?(?:be playing|switch to|become) (.{1,40}?)(?: now)?[.!]?$/iu,
+    /^from now on,? (?:i am|i'm|i(?:'ll| will) be|call me|treat me as|consider me) (.{1,40}?)[.!]?$/iu,
+    /^(?:call me|treat me as|consider me|my (?:name|role|character) is) (.{1,40}?)[.!]?$/iu,
   ]
   : [
     /^我是(.{1,30}?)(?:了)?[。.!！]?$/u,
