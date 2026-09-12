@@ -1,7 +1,9 @@
 "use client";
 
 import { FormEvent, PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from "react";
-import { cast, chapters, chapterMessages } from "./story-data";
+import { cast, chapters, chapterMessages, chapterArrivalChoices, costumeEntryMessages, openingArchivePages } from "./story-data";
+import { t, ui } from "./ui-text";
+import { DEFAULT_STYLE_ID, STYLE_OPTIONS, isStyleId } from "./style-options";
 import "./profile-crop.css";
 
 type EventType = "narration" | "action" | "dialogue" | "reaction";
@@ -65,25 +67,6 @@ function unique(values: string[]) { return [...new Set(values.filter(Boolean))];
 function staticMessages(index: number): UiMessage[] {
   return (chapterMessages[index] ?? []).map((message) => ({ ...message, eventType: message.person ? "dialogue" : "narration" }));
 }
-
-const chapterArrivalChoices: Record<number, Choice[]> = {
-  1: [
-    { kind: "action", text: "给他看门打开的那一帧" },
-    { kind: "speech", text: "先问他见没见过玛雅" },
-  ],
-  2: [
-    { kind: "action", text: "先跟着最奇怪的巡逻者走" },
-    { kind: "action", text: "不看热闹，先找玛雅" },
-  ],
-  3: [
-    { kind: "speech", text: "先问丹尼尔为什么留下" },
-    { kind: "action", text: "先看看这里复制了哪些记忆" },
-  ],
-  4: [
-    { kind: "speech", text: "先听哈罗德把理由说完" },
-    { kind: "speech", text: "先让米勒说他想保住谁" },
-  ],
-};
 
 // The cast strip is a role-card directory. Story presence is enforced by the
 // backend and must not make already published cards disappear from the UI.
@@ -165,9 +148,9 @@ function publicCharacters(payload: Record<string, unknown>) {
     characters[id] = {
       id,
       name: firstString(item.name, item.display_name, fallback?.name) ?? id,
-      role: firstString(item.role, item.title, fallback?.role) ?? "故事角色",
+      role: firstString(item.role, item.title, fallback?.role) ?? t("故事角色"),
       image: firstString(item.image, item.avatar, item.image_url, fallback?.image),
-      bio: firstString(item.bio, item.description, item.card, fallback?.bio) ?? "角色资料将在故事中逐步公开。",
+      bio: firstString(item.bio, item.description, item.card, fallback?.bio) ?? t("角色资料将在故事中逐步公开。"),
     };
   }
   return {
@@ -214,7 +197,7 @@ function normalizeOpening(payload: Record<string, unknown>): LockedOpening {
   const playerContract = asObject(payload.playerContract ?? payload.player_contract);
   const opening = asObject(payload.lockedOpening ?? payload.locked_opening ?? payload.opening) ?? {};
   const events = normalizeEvents(opening.locked_events ?? opening.events ?? opening.messages ?? opening.message, "opening");
-  if (!events.length) throw new Error("编译结果缺少 locked opening，未进入群聊。请点击重聊重新编译。");
+  if (!events.length) throw new Error(t("编译结果缺少 locked opening，未进入群聊。请点击重聊重新编译。"));
   const choices = normalizeChoices(playerContract?.opening_choices ?? playerContract?.openingChoices ?? opening.choices ?? payload.choices);
   const wildcardSpeech = normalizeChoices(playerContract?.wildcard_speech ?? playerContract?.wildcardSpeech ?? opening.wildcard_speech ?? payload.wildcard_speech, "speech");
   const { visibleMetadataIds } = publicCharacters(payload);
@@ -247,7 +230,7 @@ function normalizeChapterComplete(raw: unknown, fallbackNumber: number): Chapter
   const parsedNumber = Number(item.number ?? item.chapterNumber ?? item.chapter_number);
   const number = Number.isFinite(parsedNumber) && parsedNumber > 0 ? Math.floor(parsedNumber) : fallbackNumber;
   const chapterId = firstString(item.chapterId, item.chapter_id) ?? `chapter-${number}`;
-  const title = firstString(item.title) ?? chapters[number - 1]?.title ?? `第 ${number} 章`;
+  const title = firstString(item.title) ?? chapters[number - 1]?.title ?? ui.chapterN(number);
   const rewardContent = firstString(rewardItem?.content, rewardItem?.text, rewardItem?.transcript);
   const rewardCaption = firstString(
     rewardItem?.caption,
@@ -257,7 +240,7 @@ function normalizeChapterComplete(raw: unknown, fallbackNumber: number): Chapter
   const reward: ChapterReward = {
     id: firstString(rewardItem?.id) ?? `${chapterId}-reward`,
     type: safeRewardType,
-    title: firstString(rewardItem?.title) ?? "本章线索",
+    title: firstString(rewardItem?.title) ?? t("本章线索"),
     ...(rewardCaption ? { caption: rewardCaption } : {}),
     ...(rewardContent ? { content: rewardContent } : {}),
     ...(firstString(rewardItem?.url) ? { url: firstString(rewardItem?.url) } : {}),
@@ -267,13 +250,13 @@ function normalizeChapterComplete(raw: unknown, fallbackNumber: number): Chapter
     ...(firstString(rewardItem?.subject) ? { subject: firstString(rewardItem?.subject) } : {}),
     ...(firstString(rewardItem?.date) ? { date: firstString(rewardItem?.date) } : {}),
   };
-  if (safeRewardType === "document") reward.content = firstString(rewardItem?.text, rewardItem?.content) ?? "论文正文待录入。";
+  if (safeRewardType === "document") reward.content = firstString(rewardItem?.text, rewardItem?.content) ?? t("论文正文待录入。");
   const transitionTitle = firstString(transitionItem?.title);
   const transitionStatus = firstString(transitionItem?.status);
   const transitionKind = firstString(transitionItem?.kind);
   const transitionMedia: TransitionMedia | undefined = transitionItem ? {
     kind: transitionKind === "audio" || transitionKind === "image" ? transitionKind : "video",
-    title: transitionTitle ?? `${title} · 章节过场`,
+    title: transitionTitle ?? ui.transitionTitle(title),
     ...(transitionStatus === "pending" || transitionStatus === "ready" ? { status: transitionStatus } : {}),
     ...(firstString(transitionItem.url) ? { url: firstString(transitionItem.url) } : {}),
     ...(firstString(transitionItem.poster) ? { poster: firstString(transitionItem.poster) } : {}),
@@ -300,8 +283,8 @@ function normalizeEntryPrompt(raw: unknown): ChapterEntryPrompt | undefined {
     title,
     prompt,
     ...(firstString(item?.image) ? { image: firstString(item?.image) } : {}),
-    enterLabel: firstString(item?.enter_label, item?.enterLabel) ?? "进入",
-    waitLabel: firstString(item?.wait_label, item?.waitLabel) ?? "先确认退路",
+    enterLabel: firstString(item?.enter_label, item?.enterLabel) ?? t("进入"),
+    waitLabel: firstString(item?.wait_label, item?.waitLabel) ?? t("先确认退路"),
     ...(options.length ? { options } : {}),
   };
 }
@@ -328,19 +311,15 @@ function normalizeFinaleVote(raw: unknown): FinaleVote | undefined {
   return title && question && votes.length && options.length === 2 ? { title, question, votes, options } : undefined;
 }
 
-function chineseChapter(number: number) {
-  return ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"][number] ?? String(number);
-}
-
 function ChapterRewardCard({ reward }: { reward: ChapterReward }) {
-  const typeLabel = reward.type === "image" ? "影像证物" : reward.type === "audio" ? "音频记录" : reward.type === "video" ? "监控影像" : reward.type === "document" ? "文件证物" : "消息记录";
+  const typeLabel = reward.type === "image" ? t("影像证物") : reward.type === "audio" ? t("音频记录") : reward.type === "video" ? t("监控影像") : reward.type === "document" ? t("文件证物") : t("消息记录");
   return <article className={`chapter-reward chapter-reward-${reward.type}`}>
-    <header><span>获得线索</span><small>{typeLabel}</small></header>
-    {reward.type === "image" && <div className="reward-visual">{reward.url ? <img src={reward.url} alt={reward.title} /> : <div className="reward-empty" aria-label="线索图片待添加"><span>▧</span><small>影像待解锁</small></div>}<i aria-hidden="true">REC</i></div>}
-    {reward.type === "audio" && <div className="reward-audio">{reward.url ? <audio src={reward.url} controls preload="metadata" /> : <div className="audio-wave" aria-label="线索音频待添加"><i /><i /><i /><i /><i /><i /><i /><i /></div>}</div>}
-    {reward.type === "video" && <div className="reward-visual reward-video">{reward.url ? <video src={reward.url} poster={reward.poster} controls playsInline preload="metadata" /> : reward.poster ? <img src={reward.poster} alt={reward.title} /> : <div className="reward-empty"><span>▶</span><small>视频待添加</small></div>}<div className="reward-video-status">{reward.url ? "PLAY" : "VIDEO PENDING"}</div></div>}
-    {reward.type === "message" && <div className="reward-message"><span aria-hidden="true">⌁</span><p>{reward.content ?? "一条新消息已收入案件档案。"}</p></div>}
-    {reward.type === "document" && <details className="reward-envelope"><summary><span aria-hidden="true">✉</span><div><small>{reward.author}{reward.date ? ` · ${reward.date}` : ""}</small><strong>{reward.subject ?? reward.title}</strong></div><b>打开</b></summary><div className="reward-paper"><p>{reward.content}</p></div></details>}
+    <header><span>{t("获得线索")}</span><small>{typeLabel}</small></header>
+    {reward.type === "image" && <div className="reward-visual">{reward.url ? <img src={reward.url} alt={reward.title} /> : <div className="reward-empty" aria-label={t("线索图片待添加")}><span>▧</span><small>{t("影像待解锁")}</small></div>}<i aria-hidden="true">REC</i></div>}
+    {reward.type === "audio" && <div className="reward-audio">{reward.url ? <audio src={reward.url} controls preload="metadata" /> : <div className="audio-wave" aria-label={t("线索音频待添加")}><i /><i /><i /><i /><i /><i /><i /><i /></div>}</div>}
+    {reward.type === "video" && <div className="reward-visual reward-video">{reward.url ? <video src={reward.url} poster={reward.poster} controls playsInline preload="metadata" /> : reward.poster ? <img src={reward.poster} alt={reward.title} /> : <div className="reward-empty"><span>▶</span><small>{t("视频待添加")}</small></div>}<div className="reward-video-status">{reward.url ? "PLAY" : "VIDEO PENDING"}</div></div>}
+    {reward.type === "message" && <div className="reward-message"><span aria-hidden="true">⌁</span><p>{reward.content ?? t("一条新消息已收入案件档案。")}</p></div>}
+    {reward.type === "document" && <details className="reward-envelope"><summary><span aria-hidden="true">✉</span><div><small>{reward.author}{reward.date ? ` · ${reward.date}` : ""}</small><strong>{reward.subject ?? reward.title}</strong></div><b>{t("打开")}</b></summary><div className="reward-paper"><p>{reward.content}</p></div></details>}
     <div className="reward-copy"><h3>{reward.title}</h3>{reward.type !== "message" && reward.type !== "document" && reward.content && <p>{reward.content}</p>}{reward.caption && <small>{reward.caption}</small>}</div>
   </article>;
 }
@@ -348,16 +327,16 @@ function ChapterRewardCard({ reward }: { reward: ChapterReward }) {
 async function compileWorkflow(sessionId: string) {
   const response = await fetch("/api/workflow/compile", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId }) });
   const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) throw new Error(firstString(payload.error) ?? `Prompt 1/2 编译失败（HTTP ${response.status}）`);
-  if (!firstString(payload.sessionId)) throw new Error("编译响应缺少 sessionId");
-  if (!firstString(payload.workflowToken)) throw new Error("编译响应缺少剧情会话令牌");
+  if (!response.ok) throw new Error(firstString(payload.error) ?? ui.compileFailedHttp(response.status));
+  if (!firstString(payload.sessionId)) throw new Error(t("编译响应缺少 sessionId"));
+  if (!firstString(payload.workflowToken)) throw new Error(t("编译响应缺少剧情会话令牌"));
   return payload;
 }
 
 function Avatar({ actor, characters, onOpen }: { actor: ActorId; characters: Record<string, PublicCharacter>; onOpen?: (actor: ActorId) => void }) {
-  const entry = characters[actor] ?? { id: actor, name: actor, role: "故事角色", bio: "角色资料尚未公开。" };
+  const entry = characters[actor] ?? { id: actor, name: actor, role: t("故事角色"), bio: t("角色资料尚未公开。") };
   const visual = entry.image ? <img className="avatar" src={entry.image} alt={entry.name} /> : <span className="avatar avatar-fallback" aria-hidden="true">{entry.name.slice(0, 1)}</span>;
-  return onOpen ? <button type="button" className="avatar-button" aria-label={`查看${entry.name}角色卡`} onClick={() => onOpen(actor)}>{visual}</button> : visual;
+  return onOpen ? <button type="button" className="avatar-button" aria-label={ui.viewCard(entry.name)} onClick={() => onOpen(actor)}>{visual}</button> : visual;
 }
 
 function StoryEventMedia({ media }: { media: StoryInlineMedia }) {
@@ -366,29 +345,6 @@ function StoryEventMedia({ media }: { media: StoryInlineMedia }) {
     {media.caption && <figcaption>{media.caption}</figcaption>}
   </figure>;
 }
-
-const openingArchivePages = [
-  {
-    eyebrow: "一、时代背景档案",
-    title: "静默纽约",
-    code: "NYC–2147–NIGHT",
-    rows: [
-      { label: "时间范围", text: "2147 年，后赛博城市重建期。旧城区完成过三次基础设施改造，但大量公共系统仍靠上个世纪留下的设备勉强运转。" },
-      { label: "地点", text: "北美东岸联邦区 · 纽约。故事从第七分局辖区开始，向南连接 Red Hook 旧码头、夜间娱乐场所和长期闲置的仓储带。" },
-      { label: "社会环境评估", text: "城市拥有更聪明的监控、更快的交通和更昂贵的身体改造，却没有因此变得更体面。住房紧张，夜间经济膨胀，失踪人口被系统迅速归入待处理队列。科技负责留下记录，人仍然负责决定哪些记录值得被看见。" },
-    ],
-  },
-  {
-    eyebrow: "二、机构档案",
-    title: "纽约第七分局",
-    code: "NYPD–07–GRAVEYARD",
-    rows: [
-      { label: "机构性质", text: "纽约市警察局基层综合分局。负责辖区巡逻、失踪人口受理、初步取证、旧案归档与夜间突发事件处置。" },
-      { label: "辖区与资源", text: "辖区横跨老住宅区、货运通道和码头娱乐带。夜班人手长期不足，鉴证与技术部门在凌晨只保留值守席位，基层警员经常同时处理数个互不相干的麻烦。" },
-      { label: "内部生态评估", text: "局长哈罗德擅长控制风险，也习惯控制知情范围；艾琳负责最难收尾的失踪案；米勒承担外勤与现场支援，并用不合时宜的笑话证明自己还没被夜班彻底弄坏。这里的人并不总相信彼此，但通常知道谁会在事情失控时留下。" },
-    ],
-  },
-] as const;
 
 function OpeningArchive({ page, onPageChange, onPlay }: { page: number; onPageChange: (page: number) => void; onPlay: () => void }) {
   const dossier = openingArchivePages[page] ?? openingArchivePages[0];
@@ -407,14 +363,14 @@ function OpeningArchive({ page, onPageChange, onPlay }: { page: number; onPageCh
         </section>)}
       </div>
       <footer className="archive-footer">
-        <button type="button" aria-label="上一页档案" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}>←</button>
+        <button type="button" aria-label={t("上一页档案")} onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}>←</button>
         <span>PAGE {page + 1} / {openingArchivePages.length}</span>
-        <button type="button" aria-label="下一页档案" onClick={() => onPageChange(Math.min(openingArchivePages.length - 1, page + 1))} disabled={page === openingArchivePages.length - 1}>→</button>
+        <button type="button" aria-label={t("下一页档案")} onClick={() => onPageChange(Math.min(openingArchivePages.length - 1, page + 1))} disabled={page === openingArchivePages.length - 1}>→</button>
       </footer>
     </article>
     <div className="opening-vlog-entry">
-      <div><small>CASE MATERIAL 01</small><strong>玛雅留下的未经剪辑 Vlog</strong></div>
-      <button type="button" onClick={onPlay}>查看影像 <b aria-hidden="true">▶</b></button>
+      <div><small>CASE MATERIAL 01</small><strong>{t("玛雅留下的未经剪辑 Vlog")}</strong></div>
+      <button type="button" onClick={onPlay}>{t("查看影像")} <b aria-hidden="true">▶</b></button>
     </div>
   </div>;
 }
@@ -431,6 +387,8 @@ export default function Home() {
   const [pending, setPending] = useState(false);
   const [streamingId, setStreamingId] = useState<string | number | null>(null);
   const [restartNote, setRestartNote] = useState("");
+  // 逐轮文风：只随每次 /api/chat 请求发送，切换只影响之后的轮次，不重开会话（重开要重过 Vlog 闸门）。
+  const [styleId, setStyleId] = useState(DEFAULT_STYLE_ID);
   const [watchedVlog, setWatchedVlog] = useState(false);
   const [openingApplied, setOpeningApplied] = useState(false);
   const [compiledOpening, setCompiledOpening] = useState<LockedOpening | null>(null);
@@ -464,6 +422,8 @@ export default function Home() {
   const identityIntroSession = useRef("");
   const choiceWheelStartY = useRef<number | null>(null);
   const choiceWheelSelectionRef = useRef<number | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastFollowScrollAt = useRef(0);
   const [identityIntroQueued, setIdentityIntroQueued] = useState(false);
   const active = chapters[chapter] ?? chapters[0];
   const storyLocked = chapter === 0 && (!watchedVlog || !openingApplied);
@@ -486,7 +446,7 @@ export default function Home() {
       setOpeningArchivePage(0);
       identityIntroSession.current = "";
       setIdentityIntroQueued(false);
-      setWatchedVlog(false); setInput(""); setPlayerRoleDraft(""); setPlayerProfile(""); setVideoState("cached"); setStreamingId(null); setRestartNote("正在创建新的独立会话……");
+      setWatchedVlog(false); setInput(""); setPlayerRoleDraft(""); setPlayerProfile(""); setVideoState("cached"); setStreamingId(null); setRestartNote(t("正在创建新的独立会话……"));
     }
     try {
       const payload = await compileWorkflow(sessionId);
@@ -499,10 +459,10 @@ export default function Home() {
       setWorkflowToken(firstString(payload.workflowToken) ?? "");
       setWorkflowStatus("ready");
       if (opening.roleCardActors.length) setVisibleActors(opening.roleCardActors);
-      if (reset) setRestartNote("新的会话已经就绪。先从这段 Vlog 开始。");
+      if (reset) setRestartNote(t("新的会话已经就绪。先从这段 Vlog 开始。"));
     } catch (error) {
       if (compileVersion.current !== version) return;
-      setWorkflowError(error instanceof Error ? error.message : "Prompt 1/2 编译失败"); setWorkflowStatus("error");
+      setWorkflowError(error instanceof Error ? error.message : t("Prompt 1/2 编译失败")); setWorkflowStatus("error");
     }
   }
 
@@ -537,29 +497,61 @@ export default function Home() {
 
   function finishVlog() { setVideoState("frame"); setWatchedVlog(true); }
 
-  async function typeScene(events: ProtocolEvent[], messageId: number, mediaCues: StoryMediaCue[] = []) {
-    for (let offset = 0; offset < events.length; offset += 1) {
-      const event = events[offset];
-      const fullText = event.text.trim();
-      if (!fullText) continue;
-      const nextId = `${messageId}-${event.id}-${offset}`;
-      const message: UiMessage = { id: nextId, text: "", eventType: event.type, ...(event.person ? { person: event.person } : { kind: "system" }) };
-      setMessages((current) => [...current, message]); setStreamingId(nextId);
-      for (let cursor = 2; cursor < fullText.length + 2; cursor += 2) {
-        const visibleText = fullText.slice(0, cursor);
-        setMessages((current) => current.map((item) => item.id === nextId ? { ...item, text: visibleText } : item));
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 18));
-      }
-      setStreamingId(null);
-      const imageCue = mediaCues.find((cue) => cue.kind === "image" && cue.eventIndex === offset);
-      if (imageCue) {
-        setMessages((current) => current.map((item) => item.id === nextId
-          ? { ...item, media: { url: imageCue.url, alt: imageCue.alt ?? "剧情影像", ...(imageCue.caption ? { caption: imageCue.caption } : {}) } }
-          : item));
-      }
-      if (mediaCues.some((cue) => cue.kind === "audio" && cue.id === "ch02-childhood-song" && cue.eventIndex === offset)) void playChildhoodSong();
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 160));
-    }
+  /** 流式期间跟随滚动：节流到 ~200ms，不为每个 delta 都 scrollIntoView（会抖）。 */
+  function followScroll(force = false) {
+    const now = Date.now();
+    if (!force && now - lastFollowScrollAt.current < 200) return;
+    lastFollowScrollAt.current = now;
+    window.requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end" }));
+  }
+
+  function streamMessageId(turnId: number, index: number) { return `${turnId}-ev-${index}`; }
+
+  /** event_delta：当前事件的占位气泡（没有就建，有就追加增量）。 */
+  function appendStreamDelta(turnId: number, index: number, kind: EventType, person: string | undefined, delta: string) {
+    const id = streamMessageId(turnId, index);
+    setMessages((current) => {
+      const existing = current.find((item) => item.id === id);
+      if (existing) return current.map((item) => item.id === id ? { ...item, text: item.text + delta } : item);
+      return [...current, { id, text: delta, eventType: kind, ...(person ? { person } : { kind: "system" as const }) }];
+    });
+    setStreamingId(id);
+    followScroll();
+  }
+
+  /** event：该事件收口，占位气泡转正式气泡（person / 文本以服务端最终切分为准）。 */
+  function settleStreamEvent(turnId: number, index: number, event: ProtocolEvent) {
+    const id = streamMessageId(turnId, index);
+    const settled: UiMessage = { id, text: event.text, eventType: event.type, ...(event.person ? { person: event.person } : { kind: "system" as const }) };
+    setMessages((current) => current.some((item) => item.id === id) ? current.map((item) => item.id === id ? settled : item) : [...current, settled]);
+    setStreamingId((current) => current === id ? null : current);
+    followScroll();
+  }
+
+  /** final：用整包 events 做一次权威对齐（补上流里没到的行、替换文本），再挂媒体、放音频。 */
+  function applyFinalScene(turnId: number, events: ProtocolEvent[], mediaCues: StoryMediaCue[]) {
+    setMessages((current) => {
+      const ids = new Set(events.map((_, index) => streamMessageId(turnId, index)));
+      const kept = current.filter((item) => !(typeof item.id === "string" && item.id.startsWith(`${turnId}-ev-`) && !ids.has(item.id)));
+      const next = [...kept];
+      events.forEach((event, index) => {
+        const id = streamMessageId(turnId, index);
+        const imageCue = mediaCues.find((cue) => cue.kind === "image" && cue.eventIndex === index);
+        const message: UiMessage = {
+          id,
+          text: event.text,
+          eventType: event.type,
+          ...(event.person ? { person: event.person } : { kind: "system" as const }),
+          ...(imageCue ? { media: { url: imageCue.url, alt: imageCue.alt ?? t("剧情影像"), ...(imageCue.caption ? { caption: imageCue.caption } : {}) } } : {}),
+        };
+        const at = next.findIndex((item) => item.id === id);
+        if (at >= 0) next[at] = message; else next.push(message);
+      });
+      return next;
+    });
+    setStreamingId(null);
+    if (mediaCues.some((cue) => cue.kind === "audio" && cue.id === "ch02-childhood-song")) void playChildhoodSong();
+    followScroll(true);
   }
 
   async function playChildhoodSong() {
@@ -590,30 +582,74 @@ export default function Home() {
     const historySnapshot = messages;
     const displayText = choice.displayText?.trim() || trimmed;
     setChoiceWheelOpen(false); setChoiceWheelSelection(null); choiceWheelSelectionRef.current = null; choiceWheelStartY.current = null;
-    setMessages((current) => [...current, { id, kind: "player", label: choice.kind === "identity" ? "本次身份" : "你", text: displayText }]);
+    setMessages((current) => [...current, { id, kind: "player", label: choice.kind === "identity" ? t("本次身份") : t("你"), text: displayText }]);
     setRestartNote(""); setTurnError(""); setInput(""); setPending(true);
     try {
       const response = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, history: historySnapshot, input: trimmed, inputKind: choice.kind, ...(playerProfile ? { playerProfile } : {}), ...("id" in choice && choice.id ? { choiceId: choice.id } : {}) }),
+        body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, history: historySnapshot, input: trimmed, inputKind: choice.kind, style_id: styleId, ...(playerProfile ? { playerProfile } : {}), ...("id" in choice && choice.id ? { choiceId: choice.id } : {}) }),
       });
-      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-      if (!response.ok) throw new Error(firstString(payload.error) ?? `本轮生成失败（HTTP ${response.status}）`);
-      const nextWorkflowToken = firstString(payload.workflowToken);
-      if (!nextWorkflowToken) throw new Error("本轮响应缺少剧情会话令牌");
-      setWorkflowToken(nextWorkflowToken);
-      const updatedPlayerProfile = firstString(payload.playerProfile, payload.player_profile)?.trim();
+      if (!response.ok || !response.body) {
+        const failure = await response.json().catch(() => ({})) as Record<string, unknown>;
+        throw new Error(firstString(failure.error) ?? ui.turnFailedHttp(response.status));
+      }
+      // ndjson 帧流：route → event_delta* → event* → final → ledger；error 帧走现有错误提示。
+      const received: { final?: Record<string, unknown>; token: string } = { token: "" };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const handleFrame = (frame: Record<string, unknown>) => {
+        const type = firstString(frame.type);
+        if (type === "event_delta") {
+          const index = Number(frame.index);
+          const delta = typeof frame.text === "string" ? frame.text : "";
+          if (!Number.isInteger(index) || index < 0 || !delta) return;
+          const kind = frame.kind === "dialogue" ? "dialogue" : "narration";
+          appendStreamDelta(id, index, kind, firstString(frame.person), delta);
+        } else if (type === "event") {
+          const index = Number(frame.index);
+          const [event] = normalizeEvents(frame.event, `turn-${id}-${index}`);
+          if (Number.isInteger(index) && index >= 0 && event) settleStreamEvent(id, index, event);
+        } else if (type === "final") {
+          received.final = frame;
+          const token = firstString(frame.workflowToken);
+          if (token) received.token = token;
+        } else if (type === "ledger") {
+          const token = firstString(frame.workflowToken);
+          if (token) received.token = token;
+        } else if (type === "error") {
+          throw new Error(firstString(frame.message) ?? t("本轮生成失败，请重试。故事状态没有在页面中继续推进。"));
+        }
+      };
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        buffer += decoder.decode(part.value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          handleFrame(JSON.parse(line) as Record<string, unknown>);
+        }
+      }
+      if (buffer.trim()) handleFrame(JSON.parse(buffer) as Record<string, unknown>);
+      if (!received.final) throw new Error(t("本轮生成中断，没有收到完整结果。"));
+      const finalPayload = received.final;
+      if (!received.token) throw new Error(t("本轮响应缺少剧情会话令牌"));
+      setWorkflowToken(received.token);
+      const updatedPlayerProfile = firstString(finalPayload.playerProfile, finalPayload.player_profile)?.trim();
       if (updatedPlayerProfile && updatedPlayerProfile !== playerProfile) {
         setPlayerProfile(updatedPlayerProfile);
         setPlayerRoleDraft(updatedPlayerProfile);
       }
-      const events = normalizeEvents(payload.events, `turn-${id}`);
-      const contract = responseContract(payload.responseContract ?? payload.response_contract ?? turnContract);
-      if (events.length < contract.minEvents || events.length > contract.maxEvents) throw new Error(`协议校验失败：本轮收到 ${events.length} 条事件，要求 ${contract.minEvents}–${contract.maxEvents} 条。`);
-      const controls = responseControls(payload);
-      const mediaCues = normalizeMediaCues(payload);
-      if (controls.choices.length !== contract.choiceCount) throw new Error(`协议校验失败：本轮收到 ${controls.choices.length} 个选项，要求 ${contract.choiceCount} 个。`);
-      await typeScene(events, id, mediaCues);
+      const events = normalizeEvents(finalPayload.events, `turn-${id}`);
+      const contract = responseContract(finalPayload.responseContract ?? finalPayload.response_contract ?? turnContract);
+      if (events.length < contract.minEvents || events.length > contract.maxEvents) throw new Error(ui.eventCountMismatch(events.length, contract.minEvents, contract.maxEvents));
+      const controls = responseControls(finalPayload);
+      const mediaCues = normalizeMediaCues(finalPayload);
+      if (controls.choices.length !== contract.choiceCount) throw new Error(ui.choiceCountMismatch(controls.choices.length, contract.choiceCount));
+      applyFinalScene(id, events, mediaCues);
+      const payload = finalPayload;
       if (controls.wildcardSpeech.length) sessionWildcardSpeech.current = controls.wildcardSpeech;
       setLiveChoices(controls.choices);
       setWildcardSpeech(sessionWildcardSpeech.current);
@@ -664,14 +700,14 @@ export default function Home() {
         } : null));
         setTransitionVideoPlaying(false);
       } else if (nextTransition) {
-        showChapter(nextTransition.nextIndex, `已进入第 ${nextTransition.nextIndex + 1} 章：${nextTransition.title}。`);
+        showChapter(nextTransition.nextIndex, ui.enteredChapter(nextTransition.nextIndex + 1, nextTransition.title));
       }
       return true;
     } catch (error) {
       // Keep the submitted player line visible. This is especially important
       // for dice speech: removing it made a rejected model batch look like the
       // button had never fired, even though the request reached Prompt 3.
-      setTurnError(error instanceof Error ? error.message : "本轮生成失败，请重试。故事状态没有在页面中继续推进。");
+      setTurnError(error instanceof Error ? error.message : t("本轮生成失败，请重试。故事状态没有在页面中继续推进。"));
       return false;
     } finally { setStreamingId(null); setChapterEndingPause(false); setPending(false); }
   }
@@ -694,8 +730,8 @@ export default function Home() {
     // not count it, and the player can submit their next line with the same
     // profile without duplicate bubbles or duplicate requests.
     void send({
-      text: `我以“${playerProfile}”的身份加入现场。`,
-      displayText: `你以“${playerProfile}”的身份加入现场。`,
+      text: ui.identityJoinInput(playerProfile),
+      displayText: ui.identityJoinDisplay(playerProfile),
       kind: "identity",
     }).then((accepted) => {
       if (accepted || identityIntroSession.current !== workflowSessionId) return;
@@ -771,10 +807,10 @@ export default function Home() {
         setChapterEntryPrompt(target.entryPrompt);
         setRestartNote("");
       } else {
-        showChapter(target.nextIndex, `已进入第 ${target.nextIndex + 1} 章：${target.title}。`);
+        showChapter(target.nextIndex, ui.enteredChapter(target.nextIndex + 1, target.title));
       }
     } else {
-      setRestartNote(`第 ${chapterComplete.number} 章已完成。`);
+      setRestartNote(ui.chapterDone(chapterComplete.number));
     }
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
   }
@@ -788,24 +824,13 @@ export default function Home() {
     setPendingChapterTransition(null);
     setTransitionVideoPlaying(false);
     if (nextChapter) {
-      const costumeMessages: Record<string, UiMessage[]> = {
-        dobby: [
-          { id: `dobby-entry-${Date.now()}-1`, kind: "system", eventType: "narration", text: "三个人穿着尺寸各不相同的多比服装混进后巷。粗布吸了雨，耳朵比调查组先通过门框。门口的人只扫了一眼就放行——在 Lotus 99，打扮得太正常反而更可疑。" },
-          { id: `dobby-entry-${Date.now()}-2`, person: "miller", eventType: "dialogue", text: "先说清楚，谁敢拍照，我就把谁写进案情报告。标题叫《尊严失踪案》。" },
-          { id: `dobby-entry-${Date.now()}-3`, person: "erin", eventType: "dialogue", text: "耳朵收好。我们是来找人，不是来卡门的。" },
-        ],
-        guardians: [
-          { id: `guardians-entry-${Date.now()}-1`, kind: "system", eventType: "narration", text: "银河护卫队主题服装比计划亮了三个色号。树人外壳差点挂住消防梯，浣熊尾巴扫过门卫的杯子；对方却像每天都见这种灾难，抬手放他们进去。" },
-          { id: `guardians-entry-${Date.now()}-2`, person: "miller", eventType: "dialogue", text: "这不叫潜伏。这叫提前通知整条街：三个成年人放弃了判断。" },
-          { id: `guardians-entry-${Date.now()}-3`, person: "erin", eventType: "dialogue", text: "你选的浣熊。少抱怨，尾巴别碰证物。" },
-        ],
-      };
+      const costumeMessages: Record<string, UiMessage[]> = costumeEntryMessages(Date.now());
       const selectedOption = entryPrompt.options?.find((option) => option.id === optionId);
       showChapter(nextIndex, selectedOption
-        ? `你们换上${selectedOption.label}，进入第 ${nextIndex + 1} 章：${nextChapter.title}。`
+        ? ui.enterWithCostume(selectedOption.label, nextIndex + 1, nextChapter.title)
         : cautious
-          ? `你们先确认门后的退路和时间，再一起进入第 ${nextIndex + 1} 章：${nextChapter.title}。`
-          : `你选择跨过那扇门。已进入第 ${nextIndex + 1} 章：${nextChapter.title}。`, optionId ? costumeMessages[optionId] : undefined);
+          ? ui.enterCautious(nextIndex + 1, nextChapter.title)
+          : ui.enterBold(nextIndex + 1, nextChapter.title), optionId ? costumeMessages[optionId] : undefined);
     }
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
   }
@@ -820,7 +845,7 @@ export default function Home() {
         body: JSON.stringify({ sessionId: workflowSessionId, workflowToken, choice }),
       });
       const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-      if (!response.ok) throw new Error(firstString(payload.error) ?? "终局投票失败");
+      if (!response.ok) throw new Error(firstString(payload.error) ?? t("终局投票失败"));
       const nextWorkflowToken = firstString(payload.workflowToken);
       if (nextWorkflowToken) setWorkflowToken(nextWorkflowToken);
       const rawEnding = asObject(payload.ending);
@@ -828,7 +853,7 @@ export default function Home() {
       const id = rawEnding?.id === "destroy" || rawEnding?.id === "preserve" ? rawEnding.id : undefined;
       const title = firstString(rawEnding?.title);
       const summary = firstString(rawEnding?.summary);
-      if (!id || !title || !summary || !rawVideo) throw new Error("终局响应不完整");
+      if (!id || !title || !summary || !rawVideo) throw new Error(t("终局响应不完整"));
       setEndingResult({
         id,
         title,
@@ -841,7 +866,7 @@ export default function Home() {
       });
       setFinaleVote(null);
     } catch (error) {
-      setTurnError(error instanceof Error ? error.message : "终局投票失败");
+      setTurnError(error instanceof Error ? error.message : t("终局投票失败"));
     } finally {
       setFinalePending(false);
     }
@@ -856,10 +881,10 @@ export default function Home() {
   }
 
   const playerRoleControl = playerProfile ? null : <form className="identity-composer" onSubmit={savePlayerRole}>
-    <label htmlFor="player-role">本次身份 <small>可选</small></label>
+    <label htmlFor="player-role">{t("本次身份")} <small>{t("可选")}</small></label>
     <div>
-      <input id="player-role" aria-label="输入你想扮演的角色" value={playerRoleDraft} onChange={(event) => setPlayerRoleDraft(event.target.value)} placeholder="例如：聪明但嘴硬的天才实习生" maxLength={100} />
-      <button type="submit" disabled={!playerRoleDraft.trim()}>确认</button>
+      <input id="player-role" aria-label={t("输入你想扮演的角色")} value={playerRoleDraft} onChange={(event) => setPlayerRoleDraft(event.target.value)} placeholder={t("例如：聪明但嘴硬的天才实习生")} maxLength={100} />
+      <button type="submit" disabled={!playerRoleDraft.trim()}>{t("确认")}</button>
     </div>
   </form>;
 
@@ -874,38 +899,38 @@ export default function Home() {
     : undefined;
 
   return <main className={`app-shell ${active.bg}`}>
-    <aside className="sidebar"><div className="brand"><span className="brand-dot" /> LOTUS <b>99</b></div><div className="case-label">案件档案 / 03:00</div><nav className="chapter-list" aria-label="章节">{chapters.map((item, index) => <button key={item.title} disabled={index !== chapter} className={index === chapter ? "chapter active" : "chapter locked"}><span>0{index + 1}</span><strong>{item.title}</strong><small>{index === chapter ? item.sub : "由故事状态解锁"}</small></button>)}</nav></aside>
+    <aside className="sidebar"><button type="button" className="brand brand-reset" onClick={startOver} disabled={pending || workflowStatus === "compiling"} aria-label={t("从头开始")}><span className="brand-dot" />{t("↺ 从头开始")}</button><div className="case-label">{t("案件档案 / 03:00")}</div><nav className="chapter-list" aria-label={t("章节")}>{chapters.map((item, index) => <button key={item.title} disabled={index !== chapter} className={index === chapter ? "chapter active" : "chapter locked"}><span>0{index + 1}</span><strong>{item.title}</strong><small>{index === chapter ? item.sub : t("由故事状态解锁")}</small></button>)}</nav></aside>
     <section className="experience">
-      <header className="topbar"><button className="restart" type="button" onClick={startOver} disabled={pending || workflowStatus === "compiling"}>↺ 从头开始</button><div><span>静默纽约</span><h1>第 {chapter + 1} 章 · {active.title}</h1></div></header>
-      <div className="cast-strip" aria-label="故事角色">{visibleActors.map((actor) => { const entry = characters[actor] ?? { id: actor, name: actor, role: "故事角色", bio: "角色资料尚未公开。" }; return <div className="cast-chip" key={actor}><Avatar actor={actor} characters={characters} onOpen={setSelectedPerson} /><span>{entry.name}</span></div>; })}{!visibleActors.length && <span className="cast-empty">角色正在载入…</span>}</div>
-      <section className="cinema" aria-label="章节影像"><div className="cinema-noise" /><div className="cinema-copy"><p>CHAPTER {String(chapter + 1).padStart(2, "0")}</p><h2>{active.title}</h2><span>{active.sub}</span></div>{chapter === 0 && <OpeningArchive page={openingArchivePage} onPageChange={setOpeningArchivePage} onPlay={playIntro} />}<div className="video-badge">{videoState === "cached" ? "视频待缓存" : videoState === "playing" ? "正在播放" : "最后一帧已锁定为背景"}</div></section>
-      {videoState !== "cached" && <section className="vlog-panel" aria-label="玛雅的 Vlog"><video ref={vlogVideoRef} src="/maya-opening-vlog.mp4" poster="/chapters-maya-vlog.png" playsInline controls autoPlay={videoState === "playing"} onEnded={finishVlog} />{videoState === "frame" && <button className="close-vlog" type="button" aria-label="关闭 Vlog" onClick={() => setVideoState("cached")}>×</button>}</section>}
+      <header className="topbar"><button className="restart" type="button" onClick={startOver} disabled={pending || workflowStatus === "compiling"}>{t("↺ 从头开始")}</button><label className="style-picker"><span>{t("文风")}</span><select value={styleId} onChange={(event) => { if (isStyleId(event.target.value)) setStyleId(event.target.value); }} disabled={pending || workflowStatus === "compiling"} aria-label={t("选择文风，只影响之后的轮次")} title={t("选择文风，只影响之后的轮次")}>{STYLE_OPTIONS.map((option) => <option key={option.id} value={option.id} title={option.note}>{option.label}</option>)}</select></label><div><span>{t("静默纽约")}</span><h1>{ui.chapterHeading(chapter + 1, active.title)}</h1></div></header>
+      <div className="cast-strip" aria-label={t("故事角色")}>{visibleActors.map((actor) => { const entry = characters[actor] ?? { id: actor, name: actor, role: t("故事角色"), bio: t("角色资料尚未公开。") }; return <div className="cast-chip" key={actor}><Avatar actor={actor} characters={characters} onOpen={setSelectedPerson} /><span>{entry.name}</span></div>; })}{!visibleActors.length && <span className="cast-empty">{t("角色正在载入…")}</span>}</div>
+      <section className="cinema" aria-label={t("章节影像")}><div className="cinema-noise" /><div className="cinema-copy"><p>CHAPTER {String(chapter + 1).padStart(2, "0")}</p><h2>{active.title}</h2><span>{active.sub}</span></div>{chapter === 0 && <OpeningArchive page={openingArchivePage} onPageChange={setOpeningArchivePage} onPlay={playIntro} />}<div className="video-badge">{videoState === "cached" ? t("视频待缓存") : videoState === "playing" ? t("正在播放") : t("最后一帧已锁定为背景")}</div></section>
+      {videoState !== "cached" && <section className="vlog-panel" aria-label={t("玛雅的 Vlog")}><video ref={vlogVideoRef} src="/maya-opening-vlog.mp4" poster="/chapters-maya-vlog.png" playsInline controls autoPlay={videoState === "playing"} onEnded={finishVlog} />{videoState === "frame" && <button className="close-vlog" type="button" aria-label={t("关闭 Vlog")} onClick={() => setVideoState("cached")}>×</button>}</section>}
       <audio ref={storyAudioRef} src="/childhood-country-americana-approach.mp3" preload="auto" hidden aria-hidden="true" onEnded={() => setBlockedStoryAudioCue(false)} />
-      <section className="story-pane"><div className="scene-line"><span>当前现场</span>{active.scene}</div>{restartNote && <div className="restart-note">↺ {restartNote}</div>}<div className="messages">{messages.map((message) => {
+      <section className="story-pane"><div className="scene-line"><span>{t("当前现场")}</span>{active.scene}</div>{restartNote && <div className="restart-note">↺ {restartNote}</div>}<div className="messages">{messages.map((message) => {
         const streaming = message.id === streamingId ? "is-streaming" : "";
-        if (message.kind === "player") return <article className={`message player ${streaming}`} key={message.id}><div><header>{message.label}<small>{message.label === "本次身份" ? "你加入故事的方式" : "你的判断"}</small></header><p>{message.text}</p></div></article>;
+        if (message.kind === "player") return <article className={`message player ${streaming}`} key={message.id}><div><header>{message.label}<small>{message.label === t("本次身份") ? t("你加入故事的方式") : t("你的判断")}</small></header><p>{message.text}</p></div></article>;
         const eventType = message.eventType ?? (message.person ? "dialogue" : "narration");
         if (eventType !== "dialogue" || !message.person) return <article className={`narration-block event-${eventType} ${streaming}`} key={message.id}><p className="narration">{message.text}</p>{message.media && <StoryEventMedia media={message.media} />}</article>;
-        const entry = characters[message.person] ?? { id: message.person, name: message.person, role: "故事角色", bio: "角色资料尚未公开。" };
+        const entry = characters[message.person] ?? { id: message.person, name: message.person, role: t("故事角色"), bio: t("角色资料尚未公开。") };
         return <article className={`dialogue event-${eventType} ${streaming}`} key={message.id}><Avatar actor={message.person} characters={characters} onOpen={setSelectedPerson} /><div className="npc-copy"><header><b>{entry.name}</b></header><p>{message.text}</p>{message.media && <StoryEventMedia media={message.media} />}</div></article>;
-      })}</div>{blockedStoryAudioCue && <button className="story-audio-fallback" type="button" onClick={resumeChildhoodSong}><span aria-hidden="true">♪</span><b>播放旧音响里的童年旋律</b><small>断续、失真，像一张转坏的旧唱片</small></button>}{storyLocked ? <><p className={`watch-note ${workflowStatus === "error" ? "protocol-error" : ""}`}>{!watchedVlog ? "先播放完玛雅的 Vlog，看看在场的人各自看见了什么。" : waitingForOpening ? "Vlog 已播放，正在等待 Prompt 1/2 返回锁定开场……" : workflowStatus === "error" ? `Prompt 1/2 编译失败：${workflowError || "未知错误"}` : "正在装载锁定开场……"}</p>{playerRoleControl}</> : <>{turnError && <div className="protocol-error turn-error" role="alert"><b>本轮没有通过协议</b><span>{turnError}</span><button type="button" onClick={() => setTurnError("")}>知道了</button></div>}{identityIntroBlocking && <p className="narration typing">正在让在场的人认识你……</p>}{chapterEndingPause && <p className="narration typing">本章最后的画面还停在这里……</p>}{pending && streamingId === null && !chapterEndingPause && <p className="narration typing">正在生成一整段电影探索场景……</p>}{playerRoleControl}<div className="interaction-dock"><form className="composer" onSubmit={submit}><input aria-label="输入你的行动或判断" value={input} onChange={(event) => setInput(event.target.value)} placeholder={compiledOpening?.joinHint ?? "说说你的判断，或者直接问一个人…"} disabled={pending || identityIntroBlocking} /><button type="submit" disabled={pending || identityIntroBlocking || !input.trim()}>发送 <span>↵</span></button></form>{liveChoices.length > 0 && !identityIntroBlocking && <div className={`choice-wheel-shell ${choiceWheelOpen ? "is-open" : ""} ${choiceWheelSelection !== null ? `is-selecting-${choiceWheelSelection}` : ""}`}><div className="choice-wheel-popover" id="story-choice-wheel" aria-hidden={!choiceWheelOpen && choiceWheelSelection === null}>{liveChoices.map((choice, index) => <button type="button" disabled={pending} className={choiceWheelSelection === index ? "is-selected" : ""} key={choice.id ?? `${choice.text}-${index}`} onClick={() => void send(choice)}><span>{choice.text}</span></button>)}{wildcardSpeech.length > 0 && <button type="button" className="choice-wheel-random" aria-label="掷骰子，随机说一句协议提供的话" disabled={pending} onClick={() => void send(wildcardSpeech[Math.floor(Math.random() * wildcardSpeech.length)])}><span>🎲 随机回答</span></button>}</div><button type="button" className="choice-wheel" aria-label="剧情转盘：点击展开，上下拖动并松手直接发送" aria-expanded={choiceWheelOpen} aria-controls="story-choice-wheel" disabled={pending} onPointerDown={beginWheelDrag} onPointerMove={moveWheelDrag} onPointerUp={endWheelDrag} onPointerCancel={cancelWheelDrag} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setChoiceWheelOpen((open) => !open); } }}><span aria-hidden="true">Ⅰ</span><b>选择</b><span aria-hidden="true">Ⅱ</span></button></div>}</div></>}</section>
-      {selectedPerson && selectedCharacter && <div className="profile-overlay" role="dialog" aria-modal="true" aria-label={`${selectedCharacter.name}角色卡`} onClick={() => setSelectedPerson(null)}><section className={`profile-card ${/^[-_a-z0-9]+$/i.test(selectedPerson) ? `profile-${selectedPerson}` : ""}`} onClick={(event) => event.stopPropagation()}><button className="profile-close" onClick={() => setSelectedPerson(null)} aria-label="关闭角色卡">×</button>{selectedCharacter.image ? <img src={selectedCharacter.image} alt={selectedCharacter.name} /> : <div className="profile-placeholder">{selectedCharacter.name.slice(0, 1)}</div>}<span>{selectedCharacter.role}</span><h2>{selectedCharacter.name}</h2><p>{selectedCharacter.bio}</p></section></div>}
+      })}<div ref={messagesEndRef} aria-hidden="true" /></div>{blockedStoryAudioCue && <button className="story-audio-fallback" type="button" onClick={resumeChildhoodSong}><span aria-hidden="true">♪</span><b>{t("播放旧音响里的童年旋律")}</b><small>{t("断续、失真，像一张转坏的旧唱片")}</small></button>}{storyLocked ? <><p className={`watch-note ${workflowStatus === "error" ? "protocol-error" : ""}`}>{!watchedVlog ? t("先播放完玛雅的 Vlog，看看在场的人各自看见了什么。") : waitingForOpening ? t("Vlog 已播放，正在等待 Prompt 1/2 返回锁定开场……") : workflowStatus === "error" ? ui.compileFailedWith(workflowError || t("未知错误")) : t("正在装载锁定开场……")}</p>{playerRoleControl}</> : <>{turnError && <div className="protocol-error turn-error" role="alert"><b>{t("本轮没有通过协议")}</b><span>{turnError}</span><button type="button" onClick={() => setTurnError("")}>{t("知道了")}</button></div>}{identityIntroBlocking && <p className="narration typing">{t("正在让在场的人认识你……")}</p>}{chapterEndingPause && <p className="narration typing">{t("本章最后的画面还停在这里……")}</p>}{pending && streamingId === null && !chapterEndingPause && <p className="narration typing">{t("正在生成一整段电影探索场景……")}</p>}{playerRoleControl}<div className="interaction-dock"><form className="composer" onSubmit={submit}><input aria-label={t("输入你的行动或判断")} value={input} onChange={(event) => setInput(event.target.value)} placeholder={compiledOpening?.joinHint ?? t("说说你的判断，或者直接问一个人…")} disabled={pending || identityIntroBlocking} /><button type="submit" disabled={pending || identityIntroBlocking || !input.trim()}>{t("发送")} <span>↵</span></button></form>{liveChoices.length > 0 && !identityIntroBlocking && <div className={`choice-wheel-shell ${choiceWheelOpen ? "is-open" : ""} ${choiceWheelSelection !== null ? `is-selecting-${choiceWheelSelection}` : ""}`}><div className="choice-wheel-popover" id="story-choice-wheel" aria-hidden={!choiceWheelOpen && choiceWheelSelection === null}>{liveChoices.map((choice, index) => <button type="button" disabled={pending} className={choiceWheelSelection === index ? "is-selected" : ""} key={choice.id ?? `${choice.text}-${index}`} onClick={() => void send(choice)}><span>{choice.text}</span></button>)}{wildcardSpeech.length > 0 && <button type="button" className="choice-wheel-random" aria-label={t("掷骰子，随机说一句协议提供的话")} disabled={pending} onClick={() => void send(wildcardSpeech[Math.floor(Math.random() * wildcardSpeech.length)])}><span>{t("🎲 随机回答")}</span></button>}</div><button type="button" className="choice-wheel" aria-label={t("剧情转盘：点击展开，上下拖动并松手直接发送")} aria-expanded={choiceWheelOpen} aria-controls="story-choice-wheel" disabled={pending} onPointerDown={beginWheelDrag} onPointerMove={moveWheelDrag} onPointerUp={endWheelDrag} onPointerCancel={cancelWheelDrag} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setChoiceWheelOpen((open) => !open); } }}><span aria-hidden="true">Ⅰ</span><b>{t("选择")}</b><span aria-hidden="true">Ⅱ</span></button></div>}</div></>}</section>
+      {selectedPerson && selectedCharacter && <div className="profile-overlay" role="dialog" aria-modal="true" aria-label={ui.characterCard(selectedCharacter.name)} onClick={() => setSelectedPerson(null)}><section className={`profile-card ${/^[-_a-z0-9]+$/i.test(selectedPerson) ? `profile-${selectedPerson}` : ""}`} onClick={(event) => event.stopPropagation()}><button className="profile-close" onClick={() => setSelectedPerson(null)} aria-label={t("关闭角色卡")}>×</button>{selectedCharacter.image ? <img src={selectedCharacter.image} alt={selectedCharacter.name} /> : <div className="profile-placeholder">{selectedCharacter.name.slice(0, 1)}</div>}<span>{selectedCharacter.role}</span><h2>{selectedCharacter.name}</h2><p>{selectedCharacter.bio}</p></section></div>}
       {chapterComplete && <div className="chapter-complete-overlay" role="dialog" aria-modal="true" aria-labelledby="chapter-complete-title">
         <section className="chapter-complete-card">
           <header className="chapter-complete-head">
             <div className="chapter-complete-seal" aria-hidden="true"><span>✓</span></div>
             <p>CHAPTER {String(chapterComplete.number).padStart(2, "0")} COMPLETE</p>
-            <span>第{chineseChapter(chapterComplete.number)}章 · 完成</span>
+            <span>{ui.chapterComplete(chapterComplete.number)}</span>
             <h2 id="chapter-complete-title">{chapterComplete.title}</h2>
-            <small>这一章留下的东西，已经收入你的案件档案。</small>
+            <small>{t("这一章留下的东西，已经收入你的案件档案。")}</small>
           </header>
           {transitionMedia && <section className={`chapter-transition media-${transitionMedia.kind}`}>
-            <header><span>{transitionMedia.kind === "audio" ? "章节声音" : "章节过场"}</span><small>{transitionMediaReady ? "可播放" : "等待素材"}</small></header>
+            <header><span>{transitionMedia.kind === "audio" ? t("章节声音") : t("章节过场")}</span><small>{transitionMediaReady ? t("可播放") : t("等待素材")}</small></header>
             <div className={`chapter-transition-frame ${transitionVideoPlaying ? "is-playing" : ""}`}>
-              {transitionVideoPlaying && transitionMediaReady && transitionMedia.url && transitionMedia.kind === "video" ? <video src={transitionMedia.url} poster={transitionMedia.poster} controls playsInline autoPlay onEnded={() => setTransitionVideoPlaying(false)} /> : transitionVideoPlaying && transitionMediaReady && transitionMedia.url && transitionMedia.kind === "audio" ? <div className="transition-audio"><div className="audio-wave"><i /><i /><i /><i /><i /><i /><i /><i /></div><audio src={transitionMedia.url} controls autoPlay onEnded={() => setTransitionVideoPlaying(false)} /></div> : transitionMedia.poster ? <img src={transitionMedia.poster} alt="章节媒体预览" /> : <div className="transition-placeholder" aria-hidden="true"><span>{transitionMedia.kind === "audio" ? "♫" : "▶"}</span></div>}
-              {!transitionVideoPlaying && <div className="transition-frame-copy"><small>{transitionMediaReady ? "MEDIA READY" : "MEDIA PENDING"}</small><strong>{transitionMedia.title}</strong><span>{transitionMedia.caption ?? (transitionMediaReady ? "点击下方按钮播放" : "素材待添加")}</span></div>}
+              {transitionVideoPlaying && transitionMediaReady && transitionMedia.url && transitionMedia.kind === "video" ? <video src={transitionMedia.url} poster={transitionMedia.poster} controls playsInline autoPlay onEnded={() => setTransitionVideoPlaying(false)} /> : transitionVideoPlaying && transitionMediaReady && transitionMedia.url && transitionMedia.kind === "audio" ? <div className="transition-audio"><div className="audio-wave"><i /><i /><i /><i /><i /><i /><i /><i /></div><audio src={transitionMedia.url} controls autoPlay onEnded={() => setTransitionVideoPlaying(false)} /></div> : transitionMedia.poster ? <img src={transitionMedia.poster} alt={t("章节媒体预览")} /> : <div className="transition-placeholder" aria-hidden="true"><span>{transitionMedia.kind === "audio" ? "♫" : "▶"}</span></div>}
+              {!transitionVideoPlaying && <div className="transition-frame-copy"><small>{transitionMediaReady ? "MEDIA READY" : "MEDIA PENDING"}</small><strong>{transitionMedia.title}</strong><span>{transitionMedia.caption ?? (transitionMediaReady ? t("点击下方按钮播放") : t("素材待添加"))}</span></div>}
             </div>
-            <button className="transition-play" type="button" disabled={!transitionMediaReady} onClick={() => setTransitionVideoPlaying(true)}>{transitionMediaReady ? (transitionMedia.kind === "audio" ? "播放童年音乐" : "播放章节媒体") : "素材待添加"}</button>
+            <button className="transition-play" type="button" disabled={!transitionMediaReady} onClick={() => setTransitionVideoPlaying(true)}>{transitionMediaReady ? (transitionMedia.kind === "audio" ? t("播放童年音乐") : t("播放章节媒体")) : t("素材待添加")}</button>
           </section>}
           {!combinedChapterEntry && <ChapterRewardCard reward={chapterComplete.reward} />}
           {combinedChapterEntry && <section className="chapter-complete-entry" aria-labelledby="combined-chapter-entry-title">
@@ -913,22 +938,22 @@ export default function Home() {
             <div className="costume-entry-options">{combinedChapterEntry.options?.map((option) => <button type="button" key={option.id} onClick={() => enterChapter(false, option.id, combinedChapterEntry)}>{option.image && <img src={option.image} alt={option.label} />}<span>{option.label}</span>{option.description && <small>{option.description}</small>}</button>)}</div>
           </section>}
           {!combinedChapterEntry && <footer className="chapter-complete-actions">
-            <button type="button" onClick={continueFromChapter}>{pendingChapterTransition ? `进入第${chineseChapter(completedNextNumber)}章` : "收下线索"}<span aria-hidden="true">→</span></button>
+            <button type="button" onClick={continueFromChapter}>{pendingChapterTransition ? ui.enterChapter(completedNextNumber) : t("收下线索")}<span aria-hidden="true">→</span></button>
           </footer>}
         </section>
       </div>}
       {chapterEntryPrompt && <div className="chapter-entry-overlay" role="dialog" aria-modal="true" aria-labelledby="chapter-entry-title">
         <section className="chapter-entry-card">
-          {!chapterEntryPrompt.options?.length && <div className="chapter-entry-image">{chapterEntryPrompt.image ? <img src={chapterEntryPrompt.image} alt="章节入口" /> : <div className="entry-door" aria-hidden="true" />}</div>}
-          <div className="chapter-entry-copy"><small>第{chineseChapter(Number(chapterEntryPrompt.chapterId.replace(/\D/g, "")))}章 · CHAPTER ENTRY</small><h2 id="chapter-entry-title">{chapterEntryPrompt.title}</h2><p>{chapterEntryPrompt.prompt}</p></div>
+          {!chapterEntryPrompt.options?.length && <div className="chapter-entry-image">{chapterEntryPrompt.image ? <img src={chapterEntryPrompt.image} alt={t("章节入口")} /> : <div className="entry-door" aria-hidden="true" />}</div>}
+          <div className="chapter-entry-copy"><small>{ui.chapterEntryEyebrow(Number(chapterEntryPrompt.chapterId.replace(/\D/g, "")))}</small><h2 id="chapter-entry-title">{chapterEntryPrompt.title}</h2><p>{chapterEntryPrompt.prompt}</p></div>
           {chapterEntryPrompt.options?.length ? <div className="costume-entry-options">{chapterEntryPrompt.options.map((option) => <button type="button" key={option.id} onClick={() => enterChapter(false, option.id)}>{option.image && <img src={option.image} alt={option.label} />}<span>{option.label}</span>{option.description && <small>{option.description}</small>}</button>)}</div> : <div className="chapter-entry-actions"><button type="button" onClick={() => enterChapter(false)}>{chapterEntryPrompt.enterLabel}</button><button type="button" onClick={() => enterChapter(true)}>{chapterEntryPrompt.waitLabel}</button></div>}
         </section>
       </div>}
       {finaleVote && <div className="finale-overlay" role="dialog" aria-modal="true" aria-labelledby="finale-vote-title">
         <section className="finale-card">
           <header><small>FINAL VOTE · 1 : 1</small><h2 id="finale-vote-title">{finaleVote.title}</h2><p>{finaleVote.question}</p></header>
-          <div className="finale-votes">{finaleVote.votes.map((vote) => { const entry = characters[vote.person]; return <article key={vote.person}><Avatar actor={vote.person} characters={characters} /><div><b>{entry?.name ?? vote.person}</b><small>{vote.position === "destroy" ? "摧毁梦境" : "保留梦境"}</small><p>{vote.statement}</p></div></article>; })}</div>
-          <div className="finale-last-vote"><span>最后一票属于你</span>{finaleVote.options.map((option) => <button type="button" key={option.id} className={`finale-option ${option.id}`} disabled={finalePending} onClick={() => void castFinaleVote(option.id)}><strong>{option.label}</strong><small>{option.summary}</small></button>)}</div>
+          <div className="finale-votes">{finaleVote.votes.map((vote) => { const entry = characters[vote.person]; return <article key={vote.person}><Avatar actor={vote.person} characters={characters} /><div><b>{entry?.name ?? vote.person}</b><small>{vote.position === "destroy" ? t("摧毁梦境") : t("保留梦境")}</small><p>{vote.statement}</p></div></article>; })}</div>
+          <div className="finale-last-vote"><span>{t("最后一票属于你")}</span>{finaleVote.options.map((option) => <button type="button" key={option.id} className={`finale-option ${option.id}`} disabled={finalePending} onClick={() => void castFinaleVote(option.id)}><strong>{option.label}</strong><small>{option.summary}</small></button>)}</div>
         </section>
       </div>}
       {endingResult && <div className="ending-overlay" role="dialog" aria-modal="true" aria-labelledby="ending-title">
@@ -936,8 +961,8 @@ export default function Home() {
           <small>THE END · {endingResult.id === "destroy" ? "REALITY" : "ELEVEN MINUTES"}</small>
           <h2 id="ending-title">{endingResult.title}</h2>
           <p>{endingResult.summary}</p>
-          <div className="ending-video">{endingResult.video.url && endingResult.video.status === "ready" ? <video src={endingResult.video.url} poster={endingResult.video.poster} controls playsInline autoPlay /> : endingResult.video.poster ? <img src={endingResult.video.poster} alt={endingResult.title} /> : <div className="transition-placeholder"><span>▶</span></div>}<i>{endingResult.video.status === "ready" ? "结局影像" : "结局视频待添加"}</i></div>
-          <button type="button" onClick={startOver}>从头开始</button>
+          <div className="ending-video">{endingResult.video.url && endingResult.video.status === "ready" ? <video src={endingResult.video.url} poster={endingResult.video.poster} controls playsInline autoPlay /> : endingResult.video.poster ? <img src={endingResult.video.poster} alt={endingResult.title} /> : <div className="transition-placeholder"><span>▶</span></div>}<i>{endingResult.video.status === "ready" ? t("结局影像") : t("结局视频待添加")}</i></div>
+          <button type="button" onClick={startOver}>{t("从头开始")}</button>
         </section>
       </div>}
     </section>
