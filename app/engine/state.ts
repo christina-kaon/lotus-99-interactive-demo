@@ -10,6 +10,8 @@ export type Progress = {
   resolved_anchor_ids: string[];
   transformed_anchor_ids: string[];
   tension_summary: string;
+  /** 本章已经进行的轮数（换章归零；章节结算的「超时」条按它判）。旧 token 没有此字段时按 0。 */
+  chapter_turns: number;
 };
 
 export type DynamicNpc = { name: string; relationship: string; profile: string };
@@ -67,6 +69,7 @@ export function initialState(pack: StoryPack): EngineState {
       resolved_anchor_ids: [],
       transformed_anchor_ids: [],
       tension_summary: stagePressure,
+      chapter_turns: 0,
     },
     handoff_snapshot: pack.opening.message,
     seen_character_names: [...new Set(pack.opening.locked_events.flatMap((event) => {
@@ -95,6 +98,8 @@ export function normaliseProgress(value: unknown, fallback: Progress): Progress 
     resolved_anchor_ids: Array.isArray(record.resolved_anchor_ids) ? record.resolved_anchor_ids.filter((id): id is string => typeof id === "string") : fallback.resolved_anchor_ids,
     transformed_anchor_ids: Array.isArray(record.transformed_anchor_ids) ? record.transformed_anchor_ids.filter((id): id is string => typeof id === "string") : fallback.transformed_anchor_ids,
     tension_summary: typeof record.tension_summary === "string" ? record.tension_summary : fallback.tension_summary,
+    // P4a 不输出 progress；这里只认运行层自己封进 token 的值（旧 token 没有 → 0）。
+    chapter_turns: typeof fallback.chapter_turns === "number" && Number.isFinite(fallback.chapter_turns) ? fallback.chapter_turns : 0,
   };
 }
 

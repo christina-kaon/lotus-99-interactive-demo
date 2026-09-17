@@ -22,7 +22,8 @@ import {
   type SpeakerLabel,
 } from "../../engine/adapter";
 import { resolveMediaCues } from "../../engine/lotus-media";
-import { currentAnchor, displayName, extractLedger, runTurn, type Packet } from "../../engine/runtime";
+import { currentAnchor, displayName, extractLedger, leakedTerm, runTurn, type Packet, type RouteMeta } from "../../engine/runtime";
+import { computeTestimonies, nextAwareness, readAwareness, readTestimonies, testimonyCard } from "../../engine/case";
 import { styleProfile } from "../../engine/styles";
 import { clickedChoiceFromId, normaliseLedger, type EngineState, type SceneLedger } from "../../engine/state";
 import { lotusStoryPack, type StoryPack } from "../../engine/story-pack";
@@ -154,14 +155,27 @@ export async function POST(request: Request) {
             return speakerLabels(pack, workingState, index, publicCharacterIds(pack, index), npcNames);
           };
           const outcome = await runTurn(pack, workingState, recentScene, input, clicked, style.id, {
-            onRoute: (packet) => {
+            onRoute: (packet, meta: RouteMeta) => {
               const routedAnchor = currentAnchor(pack, packet.progress);
               const publicIds = publicCharacterIds(pack, routedAnchor.segment_index);
-              const onStageIds = packet.on_stage_ids.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
+              // 14:04 P4a：on_stage 是「本轮要读资料的人」，不是在场名单。正文还没写，这里只能给**临时**在场：
+              // on_stage ∩ 锚点 present（且账本未离场）→ 没有交集则 on_stage 去掉已离场者 → 再没有就锚点 present；final 帧按正文校正。
+              const exited = normaliseLedger(state.scene_ledger).exited;
+              const stagedIds = packet.on_stage_ids.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) && !exited.includes(speaker.label) ? [speaker.person] : []);
+              const inAnchor = stagedIds.filter((id) => routedAnchor.present.includes(id as Person));
               emit({
                 type: "route",
-                present: onStageIds.length ? onStageIds : routedAnchor.present.filter((id) => publicIds.includes(id)),
-                engine: { chain: "storyforge-p4a-p4b", mode: packet.mode, anchor: routedAnchor.id, stage: packet.progress.stage, style: style.id },
+                present: inAnchor.length ? inAnchor : stagedIds.length ? stagedIds : routedAnchor.present.filter((id) => publicIds.includes(id)),
+                engine: {
+                  chain: "storyforge-p4a-p4b",
+                  /** chain = P4a 与 P4b 都走了 kaon-router；router_fallback = P4a 调用失败、按 continue_deepen 兜底（本地没有任何离线正文回退：写手失败整轮报错）。 */
+                  runtime_mode: meta.router_fallback ? "router_fallback" : "chain",
+                  router: { character_names: meta.router_character_names },
+                  mode: packet.mode,
+                  anchor: routedAnchor.id,
+                  stage: packet.progress.stage,
+                  style: style.id,
+                },
               });
             },
             speakers: speakersFor,
@@ -191,13 +205,40 @@ export async function POST(request: Request) {
           const change = chapterChanged ? chapterChangePayload(pack, previousChapterId, packet.progress.chapter_id) : { chapterComplete: undefined, transition: undefined };
 
           const previousLedger = normaliseLedger(state.scene_ledger);
+
+          // 14:04 P4a 之后 on_stage ≠ 在场。HUD 的 present = 候选里「上一轮账本未离场，且本轮正文里真的出现（“名：”行或名字出现）」的人；
+          // 候选 = on_stage（P4a 什么都没选时用锚点 present）；一个都没校验到就退回锚点 present。
+          const stagedSpeakers = outcome.speaker_map.filter((speaker) => speaker.person && publicIds.includes(speaker.person));
+          const candidates = stagedSpeakers.length
+            ? stagedSpeakers
+            : anchor.present.filter((id) => publicIds.includes(id)).map((id) => {
+              const character = pack.cast.find((entry) => entry.id === id)!;
+              return { label: displayName(character, workingState, currentIndex), person: id as string };
+            });
+          const presentSpeakers = candidates.filter((speaker) => !previousLedger.exited.includes(speaker.label) && Boolean(leakedTerm(outcome.prose, [speaker.label])));
+          const present = presentSpeakers.length ? presentSpeakers.map((speaker) => speaker.person!) : anchor.present.filter((id) => publicIds.includes(id));
+          const presentNames = presentSpeakers.map((speaker) => speaker.label);
+
+          // 09-17 查案账本：证词三态按进度确定性重算；有翻转才出一张「证词簿」卡（状态卡纪律）；警觉值推进。
+          const testimonies = computeTestimonies(pack, currentIndex);
+          const ledgerCard = testimonyCard(readTestimonies(state.game_state), testimonies, outcome.prose);
+          const awareness = nextAwareness(pack, readAwareness(state.game_state), previousIndex, currentIndex, packet.mode);
+          const stateCards = ledgerCard ? [...outcome.state_cards, ledgerCard] : outcome.state_cards;
+
           const nextState = (sceneLedger: SceneLedger): EngineState => ({
             ...workingState,
-            progress: packet.progress,
+            progress: { ...packet.progress, chapter_turns: chapterChanged ? 0 : packet.progress.chapter_turns + 1 },
             handoff_snapshot: outcome.handoff_snapshot,
-            seen_character_names: unique([...state.seen_character_names, ...packet.turn_context.on_stage_characters.map((character) => character.name)]),
+            // 「首次正式出场」只认正文里真的在场过的人，不认只被读了资料的人。
+            seen_character_names: unique([...state.seen_character_names, ...presentNames]),
             dynamic_npcs: packet.new_npc ? [...state.dynamic_npcs, packet.new_npc] : state.dynamic_npcs,
-            game_state: outcome.game_state_delta ? { ...state.game_state, ...outcome.game_state_delta } : state.game_state,
+            // P4b 的 delta 先合并；证词簿 / 警觉值由运行层权威覆盖（P4b 只读）。
+            game_state: {
+              ...(outcome.game_state_delta ? { ...state.game_state, ...outcome.game_state_delta } : state.game_state),
+              testimonies,
+              awareness: awareness.awareness,
+              evidence_destroyed: awareness.evidence_destroyed,
+            },
             played_media_ids: [...state.played_media_ids, ...media.cues.map((cue) => cue.id)],
             revealed_ids: revealedIds,
             completed_chapters: chapterChanged ? unique([...state.completed_chapters, previousChapterId]) : state.completed_chapters,
@@ -206,10 +247,8 @@ export async function POST(request: Request) {
             scene_ledger: sceneLedger,
           });
 
-          const onStageIds = outcome.speaker_map.flatMap((speaker) => speaker.person && publicIds.includes(speaker.person) ? [speaker.person] : []);
-          const present = onStageIds.length ? onStageIds : anchor.present.filter((id) => publicIds.includes(id));
           const visibleCharacters = pack.cast.map((character) => character.id).filter((id) => publicIds.includes(id) && id in uiCast);
-          const notices = [...outcome.notices, ...(eventsConsistent ? [] : ["events_recut_mismatch"])];
+          const notices = [...outcome.notices, ...(eventsConsistent ? [] : ["events_recut_mismatch"]), ...(ledgerCard ? [`testimony_flipped:${ledgerCard.flipped.join(",")}`] : [])];
 
           // final：整包字段全部在这里（前端拿它做一次权威对齐）。token 先按旧账本封——账本抽取是收尾的小调用，
           // 不让它拖住选项出现；抽完再发 ledger 帧带重封的 token，前端以流里最后一个 token 为准。
@@ -230,21 +269,33 @@ export async function POST(request: Request) {
             ...(notices.length ? { protocolNotice: notices.join("; ") } : {}),
             engine: {
               chain: "storyforge-p4a-p4b",
+              runtime_mode: outcome.router_fallback ? "router_fallback" : "chain",
+              router: { character_names: outcome.router_character_names },
               mode: packet.mode,
               anchor: anchor.id,
               stage: packet.progress.stage,
               style: style.id,
-              stateCards: outcome.state_cards,
+              stateCards: stateCards,
               /** 揭示门槛增量校验：续写次数 / 命中词 / 丢弃行数。 */
               reveal: outcome.reveal,
               /** 本轮写手实际读到的账本投影（新账本随 ledger 帧给）。 */
               ledger: { projected: packet.turn_context.scene_ledger },
+              /** 09-17 查案账本：本轮翻转的证词 / 警觉值 / 本章轮数 / 在场校验结果。 */
+              case: {
+                testimonies_flipped: ledgerCard?.flipped ?? [],
+                awareness: awareness.awareness,
+                evidence_destroyed: awareness.evidence_destroyed,
+                chapter_turns: chapterChanged ? 0 : packet.progress.chapter_turns + 1,
+                settlement_timeout_reached: Boolean((packet.turn_context as { settlement_timeout_reached?: boolean }).settlement_timeout_reached),
+                on_stage: outcome.speaker_map.map((speaker) => speaker.label),
+                present_verified: presentNames,
+              },
             },
           });
 
           // 事件账本：以最终放行的正文为输入抽取并合并；失败沿用旧账本。
-          const onStageNames = packet.turn_context.on_stage_characters.map((character) => character.name);
-          const sceneLedger = await extractLedger(pack, outcome.prose, previousLedger, onStageNames);
+          // 「回到现场」只认正文校验过的在场者（on_stage 里只被读资料的人不算回场）。
+          const sceneLedger = await extractLedger(pack, outcome.prose, previousLedger, presentNames);
           emit({
             type: "ledger",
             workflowToken: await sealState(nextState(sceneLedger)),

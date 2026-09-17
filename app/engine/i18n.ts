@@ -48,6 +48,14 @@ const zh = {
   noVisibleEvents: "正文没有可显示的内容",
   finaleHandoff: (label: string, summary: string) => `你投出最后一票：${label}。${summary}`,
   forbiddenPrefixes: ["你", "你说", "玩家", "动作："],
+  /** 查案账本（09-17）。 */
+  testimonyCardLabel: "证词簿",
+  testimonyCardTitle: (count: number) => `${count} 条证词状态改变`,
+  testimonyCardEyebrow: "运行层记录 · 只随证物翻转",
+  testimonyStatus: { unknown: "未知 (?)", confirmed: "已证 (√)", refuted: "已推翻 (×)" } as Record<"unknown" | "confirmed" | "refuted", string>,
+  settlementJoin: (conditions: { success: string; failure: string; timeout: string }) => `成功：${conditions.success}／失败：${conditions.failure}／超时：${conditions.timeout}`,
+  timeoutNote: "超时已到，本轮应把本章推向成功或失败其一的可观察结算。",
+  evidenceAtRiskNote: (consequence: string) => `警觉值已到阈值，证物已被处理：${consequence}`,
 };
 
 const en: typeof zh = {
@@ -84,35 +92,62 @@ const en: typeof zh = {
   noVisibleEvents: "The prose contained nothing displayable",
   finaleHandoff: (label: string, summary: string) => `You cast the final vote: ${label}. ${summary}`,
   forbiddenPrefixes: ["You", "You say", "Player", "Action:"],
+  testimonyCardLabel: "Testimony Ledger",
+  testimonyCardTitle: (count: number) => `${count} statement${count === 1 ? "" : "s"} changed status`,
+  testimonyCardEyebrow: "Runtime record · flips only on evidence",
+  testimonyStatus: { unknown: "unknown (?)", confirmed: "confirmed (√)", refuted: "refuted (×)" },
+  settlementJoin: (conditions: { success: string; failure: string; timeout: string }) => `Success: ${conditions.success} / Failure: ${conditions.failure} / Timeout: ${conditions.timeout}`,
+  timeoutNote: "The timeout has been reached: this turn should carry the chapter to an observable settlement, success or failure, one of the two.",
+  evidenceAtRiskNote: (consequence: string) => `Awareness has hit its threshold and evidence has been dealt with: ${consequence}`,
 };
 
 export const engineText = IS_EN ? en : zh;
 
 /**
  * 追加在 P4a / P4b 末尾的输出语言指令（口径对齐 storyforge-chain-demo 的 route.ts）。
- * 2026-09-11 起 P4a / P4b 模板本体为英文（与英文站同一套 prompt），两个语言分支各追加一段：
- *   en —— English-only；zh —— 简体中文输出（与 en 段对称反写），保证中文站玩家可见文本仍为中文。
+ * 2026-09-17 起 P4a / P4b 模板本体回到 wiki 14:04 的中文本体（两个语言构建共用），两个语言分支各追加一段：
+ *   en —— English-only，并把模板里以汉字数写的长度换算成英文词数；zh —— 简体中文输出（模板已是汉字数，不再换算）。
  */
 export const routerLanguageAddendum = IS_EN
   ? `
 
 [LANGUAGE REQUIREMENT]
-Return every player-facing free-text field in idiomatic English only. Do not output Chinese or mixed-language labels.`
+Return every player-facing free-text field in idiomatic English only. Do not output Chinese or mixed-language labels. JSON keys and enum values (mode, kind, 起/承/转/合) stay exactly as written.`
   : `
 
 【语言要求】
 所有玩家可见的自由文本字段一律用地道的简体中文输出，不得输出英文或中英混杂的标签。JSON 字段名与枚举值保持原样，不翻译。`;
+
+/** 【查案节奏】（09-17，Lotus 表第一行「每次对话仅可推进一个阶段」的重铸）：拼在 P4a 语言指令之后，≤2 句。 */
+export const routerPacingAddendum = IS_EN
+  ? `
+
+[Investigation pacing]
+Release only one new clue per turn, or bring only one witness into the conversation; when the player reaches for several at once, pick the one closest to whoever they are actually talking to and hold the rest for the next turn.`
+  : `
+
+【查案节奏】
+每回合只放出一条新线索，或只让一位证人进入交谈；玩家同时要几条时，选与其当前交谈对象最直接的那一条，其余留到下一回合。`;
 
 export const writerLanguageAddendum = IS_EN
   ? `
 
 【English-only output】
 All player-facing generated fields—prose, handoff_snapshot, choice labels, state card label/title/summary/entries, game-state strings, character names, and narration—must be idiomatic English only. Do not output Chinese or mixed-language text, even if input history contains Chinese.
-The prose length rule "450–600 words" is already in English units for this story. Keep the screenplay layout for dialogue: "Name: line", using the English character names exactly as given in on_stage_characters. Address the player as "you".`
+The template's 正文 600–800 字 means 450–600 English words for this story; anchor_text 8–20 字 means a 6–15 word verbatim excerpt; JSON keys and enum values (mode, kind, position, 起/承/转/合) stay exactly as written. Keep the screenplay layout for dialogue: "Name: line", using the English character names exactly as given in on_stage_characters. Address the player as "you".`
   : `
 
 【中文输出】
-所有玩家可见的生成字段——prose、handoff_snapshot、选项文字、状态卡的 label/title/summary/entries、game_state 里的字符串、人物称呼与叙述——一律用地道的简体中文，不得输出英文或中英混杂的文字，即使提示词或输入里出现英文。JSON 字段名与枚举值（如 mode、kind、position、起/承/转/合）保持原样，不翻译。正文长度规则“450–600 words”在本故事对应 650–800 个汉字，其余以词数写的长度限制按同一比例理解为汉字数（anchor_text 为 8–20 字）。对白保留剧本式排版“人名：台词”，人名严格使用 on_stage_characters 给出的中文名；以“你”称呼玩家。`;
+所有玩家可见的生成字段——prose、handoff_snapshot、选项文字、状态卡的 label/title/summary/entries、game_state 里的字符串、人物称呼与叙述——一律用地道的简体中文，不得输出英文或中英混杂的文字，即使提示词或输入里出现英文。JSON 字段名与枚举值（如 mode、kind、position、起/承/转/合）保持原样，不翻译。对白保留剧本式排版“人名：台词”，人名严格使用 on_stage_characters 给出的中文名；以“你”称呼玩家。`;
+
+/** 【状态卡纪律】（09-17，通用第六节「状态栏有变化才全量，否则只出摘要」）：拼在 P4b 语言指令与账本指令之后，≤3 句。 */
+export const writerStateCardAddendum = IS_EN
+  ? `
+
+[State-card discipline] Panel-type state cards (resource bars, affinity, the testimony ledger, faction standing and other persistent panels) are output in full only on turns where their values or entries actually change. When nothing changed, do not repeat them: at most one summary line goes into handoff_snapshot. One matter, one card.`
+  : `
+
+【状态卡纪律】面板类状态卡（资源条、好感、证词簿、势力值这类持久面板）只在其数值或条目发生变化的回合全量输出。无变化不重复输出，最多在 handoff_snapshot 里带一行摘要。一件事只出一张卡。`;
 
 /**
  * 事件账本（赵艺琛 09-11）。运行层自己的两段文本，不改 wiki 里的 P4b 正文：

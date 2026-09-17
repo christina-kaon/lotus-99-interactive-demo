@@ -11,6 +11,7 @@
 import { cast as uiCast, chapters as uiChapters, storyInteraction, type Person } from "../story-data";
 import { createPrecompiledWorkflow } from "../workflow-precompiled";
 import { workflowSource } from "../workflow-source";
+import { caseRules } from "../case-rules";
 import { engineText } from "./i18n";
 import type {
   ChapterCompletionDefinition,
@@ -49,6 +50,63 @@ export type PackCharacter = {
   name_public_from_index: number;
   /** 该角色不知道的事实（原文），映射自 RuntimePackage.characters[].knowledge.does_not_know。 */
   does_not_know: string[];
+  /** 与 does_not_know 一一对应的事实 id（揭示门槛打开后运行层据此不再投影该条边界）。 */
+  does_not_know_ids: string[];
+};
+
+/* ───── 查案设定（09-17，酒馆卡结构重铸；数据在 app/case-rules.*.ts） ───── */
+
+/** 条目化世界规则：content 一条只说一件事；keys 是正文里会真实出现的名词；constant=true 全故事常驻（≤5 条）。 */
+export type RuleEntry = { id: string; content: string; keys: string[]; constant?: boolean; priority?: number };
+export type SettingRule = string | RuleEntry;
+export const ruleContent = (rule: SettingRule) => typeof rule === "string" ? rule : rule.content;
+export const isConstantRule = (rule: SettingRule) => typeof rule !== "string" && rule.constant === true;
+
+export type InvestigationStageId = "scene_survey" | "evidence_gathering" | "suspect_interrogation" | "deduction";
+/** 查案四阶段 → 既有锚点的映射；requires 指前一阶段（阶段之上的一层，不改章节/锚点结构）。 */
+export type InvestigationStage = { id: InvestigationStageId; label: string; anchor_ids: string[]; requires?: InvestigationStageId };
+/** 锚点补的标注：keys / requires（只写真前置，0–1 个）/ exclusive_group / 所属查案阶段。 */
+export type AnchorAnnotation = { keys: string[]; requires?: string[]; exclusive_group?: string; investigation_stage: InvestigationStageId };
+
+export type TestimonyStatus = "unknown" | "confirmed" | "refuted";
+/** 证词定义：confirmed_by / refuted_by 指向让它翻转的事实 id；状态由运行层按进度算，不存在定义里。 */
+export type TestimonyDefinition = { id: string; witness: string; claim: string; confirmed_by?: string; refuted_by?: string };
+/** 账本里的证词（game_state.testimonies 的元素）。 */
+export type Testimony = { id: string; witness: string; claim: string; status: TestimonyStatus; refuted_by?: string };
+/** 哪件证物让哪个 NPC 改口；requires_two_sources 时还要 second_source_fact_id 也已浮现才算改口（单条只动摇）。 */
+export type EvidenceTurn = { evidence_fact_id: string; witness: string; from_claim: string; to_claim: string; requires_two_sources?: boolean; second_source_fact_id?: string; testimony_id?: string };
+/** 章节结算三条：成功 / 失败 / 超时；timeout_turns 是机器判定用的本章轮数。 */
+export type SettlementConditions = { success: string; failure: string; timeout: string; timeout_turns: number };
+/** 知识边界条目；constant=true 常驻投影；reveal_when 满足后不再投影（即揭示）。 */
+export type KnowledgeBoundaryEntry = {
+  id: string;
+  who: string;
+  does_not_know: string;
+  keys: string[];
+  constant?: boolean;
+  reveal_when?: { after_anchor?: string; after_chapter?: string; after_turn?: number };
+};
+/** 「查得越猛凶手越早销毁证物」：确凿证据 +evidence_gain、剧烈行为 +action_gain、每回合 -decay；≥threshold 时一件证物 destroyed。 */
+export type AwarenessRule = {
+  threshold: number;
+  /** 两源级确凿证据（evidence_turns.requires_two_sources）浮现时的增量。 */
+  evidence_gain: number;
+  /** 普通线索浮现（「翻查」）的增量。 */
+  search_gain: number;
+  /** P4a 判为 open_action（越出场景的剧烈行动）的增量。 */
+  action_gain: number;
+  decay: number;
+  destroyed_evidence: { fact_id: string; label: string; consequence: string };
+};
+export type CaseRules = {
+  setting_rules: RuleEntry[];
+  investigation_stages: InvestigationStage[];
+  anchor_annotations: Record<string, AnchorAnnotation>;
+  testimonies: TestimonyDefinition[];
+  evidence_turns: EvidenceTurn[];
+  settlement_conditions: Record<string, SettlementConditions>;
+  knowledge_boundaries: KnowledgeBoundaryEntry[];
+  awareness: AwarenessRule;
 };
 
 export type PackAnchor = {
@@ -69,6 +127,12 @@ export type PackAnchor = {
   forbidden_transitions: string[];
   allowed_fact_ids: string[];
   segment_index: number;
+  /** 正文里会真实出现的名词 / 专名 / 地点 / 物件（世界书选择器命中用）。 */
+  keys: string[];
+  /** 真前置锚点 id（未全部 resolved 则不激活；见 runtime.isEligibleAnchor）。 */
+  requires: string[];
+  exclusive_group?: string;
+  investigation_stage?: InvestigationStageId;
 };
 
 export type PackChapter = {
@@ -80,6 +144,8 @@ export type PackChapter = {
   textures: string[];
   /** 本章可被自然结算的条件（wiki P2「章节结算编译规则」）：沿用 chapter_arcs 里「合」拍的 dramatic_function 原文。 */
   settlement_condition: string;
+  /** 成功 / 失败 / 超时三条（09-17）；传给 P4b 的 chapter_settlement_condition 由三条合成。 */
+  settlement_conditions?: SettlementConditions;
 };
 
 export type PackRelationship = {
@@ -106,7 +172,8 @@ export type StoryPack = {
   title: string;
   story_premise: string;
   player_context: string;
-  setting_rules: string[];
+  /** 既有字符串规则原样 + 条目化规则（RuleEntry）追加在后，索引连续。 */
+  setting_rules: SettingRule[];
   texture_pool: string[];
   cast: PackCharacter[];
   relationships: PackRelationship[];
@@ -123,6 +190,14 @@ export type StoryPack = {
   user_view: { chapter_outline: Array<{ id: string; title: string; synopsis: string }>; character_bios: Array<{ id: string; name: string; bio: string; public_from_segment?: string }> };
   /** 首个 segment id（开场发生的地方）。 */
   initial_anchor_id: string;
+  /** 查案设定（09-17）：四阶段映射、证词簿、证物改口表、常驻知识边界、警觉规则。 */
+  case: {
+    investigation_stages: InvestigationStage[];
+    testimonies: TestimonyDefinition[];
+    evidence_turns: EvidenceTurn[];
+    knowledge_boundaries: KnowledgeBoundaryEntry[];
+    awareness: AwarenessRule;
+  };
 };
 
 const personIds = Object.keys(uiCast) as Person[];
@@ -203,6 +278,7 @@ function buildPack(): StoryPack {
         const fact = factById.get(factId);
         return fact ? [fact.text] : [];
       }),
+      does_not_know_ids: (card?.knowledge?.does_not_know ?? []).filter((factId) => factById.has(factId)),
     };
   });
 
@@ -234,7 +310,12 @@ function buildPack(): StoryPack {
       const segment = chapterSegments[position];
       if (!segment) return { stage, stage_pressure: arc.beats[stage].dramatic_function, anchor_ids: [] as string[] };
       const plan = source.segmentPlan.find((entry) => entry.id === segment.id)!;
+      const annotation = caseRules.anchor_annotations[segment.id];
       anchors.push({
+        keys: annotation?.keys ?? [],
+        requires: annotation?.requires ?? [],
+        ...(annotation?.exclusive_group ? { exclusive_group: annotation.exclusive_group } : {}),
+        ...(annotation?.investigation_stage ? { investigation_stage: annotation.investigation_stage } : {}),
         id: segment.id,
         chapter_id: chapter.id,
         stage,
@@ -260,11 +341,13 @@ function buildPack(): StoryPack {
       stages,
       textures: [...new Set([ui?.scene, ...chapterSegments.map((segment) => segment.location)].filter((item): item is string => Boolean(item)))],
       settlement_condition: arc.beats["合"].dramatic_function,
+      ...(caseRules.settlement_conditions[chapter.id] ? { settlement_conditions: caseRules.settlement_conditions[chapter.id] } : {}),
     };
   });
 
   // 旧运行协议里描述“回合形状”的两条不带入（新链路按 P4b 的正文长度写，不按事件条数）。
-  const settingRules = director.constraints.filter((rule) => !engineText.droppedConstraint.test(rule));
+  // 条目化的查案规则追加在既有字符串规则之后（索引连续，P4a 的 setting_rule_indexes 直接可选）。
+  const settingRules: SettingRule[] = [...director.constraints.filter((rule) => !engineText.droppedConstraint.test(rule)), ...caseRules.setting_rules];
 
   return {
     id: "lotus99",
@@ -291,6 +374,13 @@ function buildPack(): StoryPack {
     finale_vote: runtimePackage.runtime.finale_vote,
     user_view: storyPackage.user_view,
     initial_anchor_id: segments[0].id,
+    case: {
+      investigation_stages: caseRules.investigation_stages,
+      testimonies: caseRules.testimonies,
+      evidence_turns: caseRules.evidence_turns,
+      knowledge_boundaries: caseRules.knowledge_boundaries,
+      awareness: caseRules.awareness,
+    },
   };
 }
 
