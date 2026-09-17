@@ -7,7 +7,8 @@ import P4A_TEMPLATE from "../prompts/p4a";
 import P4B_TEMPLATE from "../prompts/p4b";
 import { IS_EN } from "../locale";
 import { styleProfile } from "./styles";
-import { engineText, ledgerDirective, ledgerExtractionPrompt, routerLanguageAddendum, writerLanguageAddendum } from "./i18n";
+import { engineText, ledgerDirective, ledgerExtractionPrompt, routerLanguageAddendum, routerPacingAddendum, writerLanguageAddendum, writerStateCardAddendum } from "./i18n";
+import { readAwareness } from "./case";
 import { completion, completionStream, jsonCandidates, proseClosed, scanProse } from "./kaon";
 import { proseToEvents, type FrontendEvent, type SpeakerLabel } from "./adapter";
 import {
@@ -21,7 +22,7 @@ import {
   type Progress,
   type SceneLedger,
 } from "./state";
-import { STAGES, type PackAnchor, type PackCharacter, type StoryPack } from "./story-pack";
+import { STAGES, isConstantRule, ruleContent, type PackAnchor, type PackCharacter, type StoryPack } from "./story-pack";
 
 export type HistoryItem = { role: "player" | "story"; text: string };
 export type SidecarChoice = { label: string; kind: "mainline" | "deepen" | "freeplay"; anchor_id: string | null };
@@ -53,7 +54,14 @@ export type TurnOutcome = {
   events: FrontendEvent[];
   /** 揭示门槛的增量校验统计（排查用，进 final.engine）。 */
   reveal: RevealStats;
+  /** P4a 调用失败、按 continue_deepen 兜底（此时 runtime_mode 不是 chain）。 */
+  router_fallback: boolean;
+  /** P4a 原样输出的 context_selection.character_names（验收记录用；null = 没给这个数组）。 */
+  router_character_names: string[] | null;
 };
+
+/** onRoute 钩子附带的运行信息（不进 packet，所以 P4b 看不到）。 */
+export type RouteMeta = { router_fallback: boolean; router_character_names: string[] | null };
 
 export type RevealStats = {
   /** 命中禁词后带前缀续写的次数（最多 2）。 */
@@ -72,7 +80,7 @@ export type RevealStats = {
  */
 export type TurnHooks = {
   /** P4a 完成、packet 组好（写手还没开始）。 */
-  onRoute?: (packet: Packet) => void;
+  onRoute?: (packet: Packet, meta: RouteMeta) => void;
   /** 当前进度下正文里允许识别为说话人的标签 → person（决定一行是对白还是旁白）。不传则全部按旁白。 */
   speakers?: (packet: Packet) => SpeakerLabel[];
   /** 第 index 条事件的**增量**文本（已经过禁词校验、确定不会被撤回的部分）。 */
@@ -88,11 +96,13 @@ const styleTurn = (styleId?: string) => {
 };
 
 /**
- * P4a / P4b 提示词本体为英文（2026-09-11 起与英文站同一套）；zh / en 各在末尾追加一段输出语言指令。
- * P4b 之后再追加运行层自己的事件账本指令（zh/en 各一段，不动 wiki 正文）。
+ * P4a / P4b 提示词本体 = wiki《链路》14:04 快照的中文本体（2026-09-17 起，两个语言构建共用；一个字不改）。
+ * 模板之后按顺序拼运行层自己的追加块（zh/en 各一段，见 i18n.ts）：
+ *   P4a：语言指令 → 【查案节奏】
+ *   P4b：语言指令 → 【事件账本】 → 【状态卡纪律】
  */
-const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}`;
-const WRITER_TEMPLATE = `${P4B_TEMPLATE}${writerLanguageAddendum}${ledgerDirective}`;
+const ROUTER_PROMPT = `${P4A_TEMPLATE}${routerLanguageAddendum}${routerPacingAddendum}`;
+const WRITER_TEMPLATE = `${P4B_TEMPLATE}${writerLanguageAddendum}${ledgerDirective}${writerStateCardAddendum}`;
 
 /** 投给 P4a 输入与 P4b packet 的账本投影（events 只带最近 8 条）。 */
 function ledgerProjection(ledger: SceneLedger) {
@@ -113,9 +123,16 @@ function chapterIndex(pack: StoryPack, chapterId: string) {
   return pack.chapters.findIndex((chapter) => chapter.chapter_id === chapterId);
 }
 
+/** 锚点的真前置是否全部落地：resolved，或正是即将被离开的 active 锚点（激活下一锚点时它才被记入 resolved）。 */
+export function requiresMet(anchor: PackAnchor, progress: Progress) {
+  return anchor.requires.every((id) => progress.resolved_anchor_ids.includes(id) || progress.active_anchor_id === id);
+}
+
 export function isEligibleAnchor(pack: StoryPack, anchor: PackAnchor, progress: Progress) {
   if (progress.active_anchor_id === anchor.id) return true;
   if (progress.resolved_anchor_ids.includes(anchor.id)) return false;
+  // 09-17：requires 未全部 resolved 则不激活（查案阶段门，防跳步）；章节 ±1 / 阶段顺序的隐含规则照旧。
+  if (!requiresMet(anchor, progress)) return false;
   const current = chapterIndex(pack, progress.chapter_id);
   const target = chapterIndex(pack, anchor.chapter_id);
   if (current < 0 || target < current || target > current + 1) return false;
@@ -224,11 +241,34 @@ export function baseRelationshipMemory(pack: StoryPack, state: EngineState, curr
   }));
 }
 
+/** 知识边界条目的 reveal_when 是否已满足（满足 = 已揭示，不再投给 P4b）。 */
+function boundaryRevealed(pack: StoryPack, progress: Progress, turns: number, reveal?: { after_anchor?: string; after_chapter?: string; after_turn?: number }) {
+  if (!reveal) return false;
+  if (reveal.after_anchor && (progress.resolved_anchor_ids.includes(reveal.after_anchor))) return true;
+  if (reveal.after_chapter && chapterIndex(pack, progress.chapter_id) > chapterIndex(pack, reveal.after_chapter)) return true;
+  if (typeof reveal.after_turn === "number" && turns >= reveal.after_turn) return true;
+  return false;
+}
+
 function knowledgeBoundaries(pack: StoryPack, state: EngineState, currentIndex: number, onStage: StageCharacter[]) {
   const boundaries: Array<{ who: string; does_not_know: string }> = [];
   for (const character of onStage) {
     const packChar = pack.cast.find((entry) => entry.id === character.id);
-    if (packChar?.does_not_know.length) boundaries.push({ who: character.name, does_not_know: packChar.does_not_know.join(engineText.listJoin) });
+    if (!packChar) continue;
+    // 09-17：该事实的揭示门槛已经打开（= 已在正文里被公开）就不再说这个人「不知道」——揭示条件即 reveal_when。
+    const unknown = packChar.does_not_know.filter((_text, index) => {
+      const factId = packChar.does_not_know_ids[index];
+      const fact = factId ? pack.facts.find((entry) => entry.id === factId) : undefined;
+      const rule = fact?.reveal_gate_id ? pack.reveal_rules.find((entry) => entry.gate_id === fact.reveal_gate_id) : undefined;
+      return !(rule && rule.opens_at_index < currentIndex);
+    });
+    if (unknown.length) boundaries.push({ who: character.name, does_not_know: unknown.join(engineText.listJoin) });
+  }
+  // 09-17：条目化知识边界（常驻底座 + 带 reveal_when 的条目；已揭示的不投）。
+  for (const entry of pack.case.knowledge_boundaries) {
+    if (boundaryRevealed(pack, state.progress, state.turns, entry.reveal_when)) continue;
+    if (!entry.constant && !entry.keys.length) continue;
+    boundaries.push({ who: entry.who, does_not_know: entry.does_not_know });
   }
   const forbidden = forbiddenTerms(pack, currentIndex);
   if (forbidden.length) boundaries.push({ who: engineText.forbiddenWho, does_not_know: forbidden.join(engineText.listJoin) });
@@ -260,6 +300,8 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
       active_anchor_id: selected.id,
       resolved_anchor_ids: resolvedAnchorIds,
       tension_summary: pack.chapters.find((chapter) => chapter.chapter_id === selected.chapter_id)?.stages.find((stage) => stage.anchor_ids.includes(selected.id))?.stage_pressure ?? selected.content,
+      // 跨章激活时本章轮数归零（同章内继续累计；每轮 +1 由 route 在封 token 时做）。
+      chapter_turns: selected.chapter_id === previous.chapter_id ? previous.chapter_turns : 0,
     }
     : previous;
   const anchor = currentAnchor(pack, progress);
@@ -283,7 +325,8 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
     const character = pack.cast.find((entry) => entry.id === id);
     return character ? [displayName(character, state, currentIndex)] : [];
   });
-  const stagedNames = [...new Set([...(newNpc ? [newNpc.name] : []), ...requestedNames])].slice(0, 3);
+  // 14:04 P4a：character_names 0–6 名 = 本轮需要读取资料的人物（不等于在场名单）；上限随模板从 3 放到 6。
+  const stagedNames = [...new Set([...(newNpc ? [newNpc.name] : []), ...requestedNames])].slice(0, 6);
   // P4a 明确输出空 character_names 表示玩家要独处；只有它什么都没给时才回落到本段 present。
   const routerChoseNobody = Array.isArray(selection.character_names) && selection.character_names.length === 0;
   const finalNamesBeforeLedger = stagedNames.length ? stagedNames : routerChoseNobody ? [] : defaultNames;
@@ -324,6 +367,21 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
   const ruleIndexes = Array.isArray(selection.setting_rule_indexes)
     ? selection.setting_rule_indexes.filter((index): index is number => typeof index === "number" && Number.isInteger(index) && index >= 0 && index < pack.setting_rules.length)
     : [];
+  // 常驻规则（constant）每轮都投；P4a 选中的按索引追加；P4a 什么都没选时沿用旧行为——全部规则。
+  const constantIndexes = pack.setting_rules.flatMap((rule, index) => isConstantRule(rule) ? [index] : []);
+  const relevantRuleIndexes = ruleIndexes.length ? [...new Set([...constantIndexes, ...ruleIndexes])].sort((left, right) => left - right) : pack.setting_rules.map((_rule, index) => index);
+
+  // 09-17 章节结算三条 + 超时判定：本轮是本章第 chapter_turns+1 轮；到 timeout_turns 时告诉 P4b 该收束了（不硬跳章）。
+  const settlement = chapter.settlement_conditions;
+  const settlementTimeoutReached = Boolean(settlement && progress.chapter_turns + 1 >= settlement.timeout_turns);
+  // 09-17 警觉值：上一轮结束时已达阈值 → 本轮告诉 P4b 证物已被处理（evidence_at_risk）。
+  const awareness = readAwareness(state.game_state);
+  const evidenceAtRisk = awareness.evidence_destroyed.includes(pack.case.awareness.destroyed_evidence.fact_id);
+  const runtimeNotes = [
+    ...(settlementTimeoutReached ? [engineText.timeoutNote] : []),
+    ...(evidenceAtRisk ? [engineText.evidenceAtRiskNote(pack.case.awareness.destroyed_evidence.consequence)] : []),
+  ];
+  const investigationStage = pack.case.investigation_stages.find((stage) => stage.anchor_ids.includes(anchor.id));
 
   return {
     mode: safeMode,
@@ -333,8 +391,11 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
     turn_context: {
       story_premise: pack.story_premise,
       player_context: state.player_profile ? `${pack.player_context}${engineText.playerProfilePrefix}${state.player_profile}` : pack.player_context,
-      chapter_settlement_condition: chapter.settlement_condition,
-      relevant_setting_rules: ruleIndexes.length ? ruleIndexes.map((index) => pack.setting_rules[index]) : pack.setting_rules,
+      chapter_settlement_condition: settlement ? engineText.settlementJoin(settlement) : chapter.settlement_condition,
+      ...(settlementTimeoutReached ? { settlement_timeout_reached: true } : {}),
+      ...(evidenceAtRisk ? { evidence_at_risk: true } : {}),
+      ...(runtimeNotes.length ? { runtime_notes: runtimeNotes } : {}),
+      relevant_setting_rules: relevantRuleIndexes.map((index) => ruleContent(pack.setting_rules[index])),
       on_stage_characters: onStage.map(({ id: _id, ...character }) => character),
       relevant_relationships: relevantRelationships,
       relevant_knowledge_boundaries: knowledgeBoundaries(pack, state, currentIndex, onStage),
@@ -343,6 +404,7 @@ export function makePacket(pack: StoryPack, route: Record<string, unknown>, stat
       scene: {
         chapter_pressure: chapter.chapter_pressure,
         stage_pressure: stage.stage_pressure,
+        ...(investigationStage ? { investigation_stage: investigationStage.label } : {}),
         active_anchor: {
           id: anchor.id,
           content: anchor.content,
@@ -384,7 +446,7 @@ function routerInput(pack: StoryPack, state: EngineState, recentScene: string, i
       ...publicRelationships(pack, state, currentIndex).map(({ pair, relationship_context }) => ({ pair, relationship_context })),
       ...routerNpcs.map((npc) => ({ pair: [engineText.playerLabel, npc.name], relationship_context: npc.relationship })),
     ],
-    setting_rules: pack.setting_rules.map((content, index) => ({ index, content })),
+    setting_rules: pack.setting_rules.map((rule, index) => ({ index, content: ruleContent(rule) })),
     textures: pack.texture_pool.map((content, index) => ({ index, content })),
     relationship_memory: baseRelationshipMemory(pack, state, currentIndex).map((memory, index) => ({ index, ...memory })),
     dynamic_npcs: routerNpcs,
@@ -518,6 +580,7 @@ function settleChapter(pack: StoryPack, progress: Progress): Progress {
     active_anchor_id: firstAnchorId,
     resolved_anchor_ids: [...new Set([...progress.resolved_anchor_ids, ...(progress.active_anchor_id ? [progress.active_anchor_id] : [])])],
     tension_summary: next.stages[0]?.stage_pressure ?? next.chapter_pressure,
+    chapter_turns: 0,
   };
 }
 
@@ -668,6 +731,7 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
   const notices: string[] = [];
   const routerNpcs = state.dynamic_npcs;
   let route: Record<string, unknown> = {};
+  let routerFallback = false;
   try {
     const routerResponse = await completion(ROUTER_PROMPT, JSON.stringify(routerInput(pack, state, recentScene, input, normaliseClickedChoice(clicked), routerNpcs)), { temperature: 0.22, maxTokens: 850, timeoutMs: 45000 });
     route = jsonCandidates(routerResponse.raw);
@@ -675,10 +739,13 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
     // 路由失败时按 continue_deepen 继续，正文仍然生成；只是这一轮不会推进锚点。
     notices.push(`router_fallback:${error instanceof Error ? error.message : String(error)}`);
     route = { mode: "continue_deepen" };
+    routerFallback = true;
   }
   route = applyClickedMainline(pack, route, clicked, state.progress);
   const packet = makePacket(pack, route, state);
-  hooks.onRoute?.(packet);
+  const routerSelection = route.context_selection && typeof route.context_selection === "object" ? route.context_selection as Record<string, unknown> : {};
+  const routerCharacterNames = Array.isArray(routerSelection.character_names) ? routerSelection.character_names.filter((name): name is string => typeof name === "string") : null;
+  hooks.onRoute?.(packet, { router_fallback: routerFallback, router_character_names: routerCharacterNames });
   const currentIndex = currentAnchor(pack, packet.progress).segment_index;
   const forbidden = forbiddenTerms(pack, currentIndex);
   const streamer = new LineStreamer(hooks.speakers?.(packet) ?? [], forbidden, hooks);
@@ -765,5 +832,7 @@ export async function runTurn(pack: StoryPack, state: EngineState, recentScene: 
     speaker_map: packet.on_stage_ids,
     events: streamer.events,
     reveal,
+    router_fallback: routerFallback,
+    router_character_names: routerCharacterNames,
   };
 }
